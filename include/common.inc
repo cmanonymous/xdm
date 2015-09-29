@@ -66,6 +66,7 @@ enum {
 enum {
 	D_CONSISTENT,
 	D_INCONSISTENT,
+	D_FAIL,
 };
 
 enum {
@@ -81,6 +82,16 @@ enum {
 enum {
 	PROTO_ASYNC,
 	PROTO_SYNC,
+};
+
+enum {
+	MODE_SHARE,
+	MODE_UNSHARE,
+};
+
+enum node_type {
+	LOCAL_NODE = 0,
+	SITE_NODE = 1,
 };
 
 #endif // __COMMON_INC__

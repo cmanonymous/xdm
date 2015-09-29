@@ -7,7 +7,7 @@
 #include "bio_handler.h"
 #include "hadm_device.h"
 #include "bwr.h"
-#include "hadm_node.h"
+#include "hadm_site.h"
 #include "fullsync.h"
 #include "dbm.h"
 

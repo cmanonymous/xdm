@@ -131,12 +131,12 @@ node_worker_function() 做的事情就是从 node->work_q 中取得数据，根�
 到 dev->meta_q 中。
 
 对于 meta 类型的包，目前有两种类型的包有不同的处理，也就是不加到设备的队列中，这
-两种包的类型是 P_META_PING 和 P_META_PING_ACK。对于 P_META_PING 来说，它的处理函
-数是 w_node_meta_ping_action()，它将会构造一个 P_META_PING_ACK 的包，挂入对应节
-点的 meta_q 队列中；也就是说，如果从节点 1 中收到一个 P_META_PING 的包，那么这个
-函数将会返回一个 P_META_PING_ACK 的包给节点 1。
+两种包的类型是 P_{SC,NC}_PING 和 P_{SC,NC}_PING_ACK。对于 P_{SC,NC}_PING 来说，它的处理函
+数是 w_node_meta_ping_action()，它将会构造一个 P_{SC,NC}_PING_ACK 的包，挂入对应节
+点的 meta_q 队列中；也就是说，如果从节点 1 中收到一个 P_{SC,NC}_PING 的包，那么这个
+函数将会返回一个 P_{SC,NC}_PING_ACK 的包给节点 1。
 
-对于 P_META_PING_ACK 的包，则只是减少一次节点检测的次数(--node->ping)。
+对于 P_{SC,NC}_PING_ACK 的包，则只是减少一次节点检测的次数(--node->ping_count)。
 
 ## node 的 data_q/meta_q/work_q 的数据从哪里来？
 
@@ -276,22 +276,101 @@ P_NODE_CONN_STATE 的 meta 包，对于每个节点，如果已经建立了 DATA
 
 ## ping_timer_cb()
 
-这个定时器是每个节点一个。每次被调用的时候，如果情况正常，就创建一个 P_META_PING
+这个定时器是每个节点一个。每次被调用的时候，如果情况正常，就创建一个 P_{SC,NC}_PING
 的 meta 包，挂入到节点的 meta_q 队列中。
 
 如果 meta 没有连接，那么就没有什么事情可做的，因为这种包类型只能通过 meta 连接发
 送，所以可以直接返回。如果尝试发送包的次数超过了限制，就认为连接已经断开，这时候
-就删除节点的 dfd 和 mfd 的监听事件。能够这样做的原因是，发送一次 P_META_PING 的
-包会使 node->ping 加 1，收到一个 P_META_PING_ACK 的包会使 node->ping 减 1。也就
-是说，如果限制次数是 3 的话，那么发送了 3 次 P_META_PING 的包，而没有得到一次
-P_META_PING_ACK 的应答，那么就认为连接已经断开了。
+就删除节点的 dfd 和 mfd 的监听事件。能够这样做的原因是，发送一次 P_{SC,NC}_PING 的
+包会使 node->ping_count 加 1，收到一个 P_{SC,NC}_PING_ACK 的包会使 node->ping_count
+减 1。也就是说，如果限制次数是 3 的话，那么发送了 3 次 P_{SC,NC}_PING 的包，而没有
+得到一次P_{SC,NC}_PING_ACK 的应答，那么就认为连接已经断开了。
 
 ## kmod_check_timer_cb()
 
 在每次调用的时候，它会去检查内核模块是否已经卸载了。如果已经卸载，那么 server 进
 程就退出。
 
-# node->ping node_list->ping node_list->pingtimer 这些字段都是什么意思？
+# node->ping_timer_timeout node->max_ping_count node->ping_count 这些字段都是什么意思？
+
+node->ping_timer_timeout 是节点的 ping 定时器的超时时间，每经过这样一个时间间隔，
+节点的 ping 定时器就会运行，它将会调用 ping_timer_cb() 运行。
+
+node->max_ping_count 是节点间最大的无响应心跳包个数。当系统中无响应的心跳包超过
+了这个次数，就认为连接已经断开了。
+
+node->ping_count 是节点间无响应心跳包的个数。在每次发送心跳包
+（P_SC_PING,P_NC_PING）之后，这个计数器就会增加；在每次收到响应包
+（P_SC_PING_ACK,P_NC_PING_ACK）之后，这个计数器就会减小。
+
+在配置文件中，这些配置的字段分别是：
+
+<pingtimeout>10</pingtimeout> ==> node->ping_timer_timeout
+<maxpingcount>10</maxpingcount> ==> node->max_ping_count
+
+在 Git 仓库的这个提交 68e67ba71f9eb2482322ef69969cd229d89164a5 之前，配置文件的
+字段和代码中的字段分别是：
+
+<ping>10</ping> ==> node_list->ping
+<pingtimeout>10</pingtimeout> ==> node_list->pingtimeout
+
+改动之后的字段的对应关系为：
+
+node_list->ping ==> node->ping_timer_timeout
+node_list->pingtimeout ==> node->max_ping_count
+node->ping ==> node->ping_count
+
+# 节点间是如何连接的？
+
+节点间的连接由 node_list_do_connect() 完成。这个函数接收一个节点列表，尝试和除了
+本地节点外的所有节点建立连接。总体上分为 3 个步骤：
+
+1. 作为客户端，发起和其他节点的连接
+2. 作为服务器，响应其他节点发起的连接
+3. 作为客户端，接收服务器的响应
+
+注意，当作为客户端时，一个节点只会对节点 id 小于自己的节点发起连接。在每次完成步
+骤 1 之后，将会等待其他节点到来的连接，如果没有节点连接上来，在超过一个超时时间
+之后，就会进行下一次尝试，尝试到了最大次数之后，就会终止当前的连接。节点间的连接
+就会等到下一次连接定时器的到来。
+
+节点间的连接代码如下，为了简化删除了一些代码：
+
+```C
+while (1) {
+	FD_ZERO(&rfds);
+	FD_SET(sfd, &rfds);
+
+	client_connect_server_list(node_list, &rfds);
+	nfds = select(SELECT_MAX_FDS, &rfds, NULL, NULL, &tv);
+	if (nfds == 0) {
+		n_try += 1;
+		sec <<= 1;
+		if (n_try > CONNECT_TRY)
+			break;
+	} else if (nfds > 0) {
+		if (FD_ISSET(sfd, &rfds)) {
+			ret = server_response_client(sfd, node_list);
+			if (ret < 0)
+				continue;
+		} else {
+			client_accept_server(node_list, &rfds);
+		}
+	}
+
+	if ((ret = check_all_connected(node_list))) {
+		log_info("all nodes connected!");
+		break;
+	}
+}
+```
+
+在步骤 1 中，发起和 site 的连接时，要将正确的本地 site 的地址发送过去，这样可以
+让对端知道是哪个节点发起的连接。需要这样做的原因是，一个节点可能会运行多个资源，
+这样一个物理节点就会有多个 runsite 的实例，每个实例会有不同的 IP。
+
+节点在收到其他节点的响应之后，它需要做的事情是安装节点的回调函数，这些回调函数要
+处理的时间包括节点事件和定时器事件。
 
 huruiqin
 2015.4.17

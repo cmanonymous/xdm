@@ -1,5 +1,6 @@
 #include <linux/slab.h>
 #include <linux/hash.h>
+#include <linux/delay.h>
 
 #include "buffer.h"
 #include "bwr.h"
@@ -11,9 +12,99 @@ static inline uint64_t data_hash(sector_t sector)
         return hash_64(sector, HASH_ENTRIES_SHIFT);
 }
 
-static inline int get_hadmdev_minor_from_buffer(struct data_buffer *buffer)
+void dump_buffer_inuse(struct data_buffer *buffer)
 {
-	return ((struct hadmdev *)buffer->private)->minor;
+	int p_flag = 0;
+	struct bwr_data *bwr_data, *prev_data = NULL;
+
+	pr_info("%s dump inuse buffer:\n", __FUNCTION__);
+	if (buffer->inuse_head) {
+		pr_info("inuse list size:%lld, (%llu:%llu).\n",
+				buffer->inuse_size, bwr_data_seq(buffer->inuse_head), bwr_data_seq(buffer->tail_data));
+		for (bwr_data = buffer->inuse_head;
+				;
+				bwr_data = list_entry(bwr_data->list.next, struct bwr_data, list)) {
+			if (!prev_data) {
+				printk("[BEGIN]: %llu(%lu %lu) ", bwr_data->meta.bwr_seq,
+						bwr_data->meta.bwr_sector, bwr_data->meta.dev_sector);
+				p_flag = 1;
+			} else if (bwr_data_seq(bwr_data) != bwr_data_seq(prev_data) + 1) {
+				if (!p_flag)
+					printk("->%llu(%lu %lu) ",
+							prev_data->meta.bwr_seq, prev_data->meta.bwr_sector, prev_data->meta.dev_sector);
+				printk("->%llu(%lu %lu) ", bwr_data->meta.bwr_seq, bwr_data->meta.bwr_sector, bwr_data->meta.dev_sector);
+				p_flag = 1;
+			} else {
+				if (bwr_data != buffer->tail_data && p_flag)
+					printk("->...");
+				p_flag = 0;
+			}
+
+			if (bwr_data == buffer->tail_data) {
+				if (!p_flag)
+					printk("->%llu(%lu %lu)",
+							bwr_data->meta.bwr_seq, bwr_data->meta.bwr_sector, bwr_data->meta.dev_sector);
+				break;
+			}
+			prev_data = bwr_data;
+		}
+	}
+	printk("[END]\n");
+}
+
+void dump_buffer_hash(struct hlist_head *head)
+{
+        struct bwr_data *bwr_data;
+        struct hlist_node *node_iter;
+
+        pr_info("%s dump hash buffer:\n", __FUNCTION__);
+        hlist_for_each_entry(bwr_data, node_iter, head, list_hash) {
+		printk("->%llu(%lu %lu) ", bwr_data->meta.bwr_seq, bwr_data->meta.bwr_sector, bwr_data->meta.dev_sector);
+        }
+	pr_info("\n");
+}
+
+void dump_buffer_data(struct data_buffer *buffer)
+{
+	int p_flag = 0;
+	struct bwr_data *bwr_data, *prev_data = NULL;
+
+	pr_info("%s dump data buffer:\n", __FUNCTION__);
+	pr_info("data size:%lld, inuse_size:%lld(%llu:%llu).\n",
+			buffer->data_size, buffer->inuse_size,
+			buffer->inuse_head ? bwr_data_seq(buffer->inuse_head) : 0,
+			buffer->inuse_head ? bwr_data_seq(buffer->tail_data) : 0);
+	if (!list_empty(&buffer->data_list)) {
+		list_for_each_entry(bwr_data, &buffer->data_list, list) {
+			if (!prev_data) {
+				printk("[BEGIN]: %llu(%lu %lu) ", bwr_data->meta.bwr_seq,
+						bwr_data->meta.bwr_sector, bwr_data->meta.dev_sector);
+				p_flag = 1;
+			} else if (bwr_data_seq(bwr_data) != bwr_data_seq(prev_data) + 1) {
+				if (!p_flag)
+					printk("->%llu(%lu %lu) ",
+							prev_data->meta.bwr_seq, prev_data->meta.bwr_sector, prev_data->meta.dev_sector);
+				printk("->%llu(%lu %lu) ", bwr_data->meta.bwr_seq, bwr_data->meta.bwr_sector, bwr_data->meta.dev_sector);
+				p_flag = 1;
+			} else {
+				if (p_flag)
+					printk("->...");
+				p_flag = 0;
+			}
+			prev_data = bwr_data;
+		}
+		if (!p_flag) {
+			bwr_data = list_entry(buffer->data_list.prev, struct bwr_data, list);
+			printk("->%llu(%lu %lu)",
+					bwr_data->meta.bwr_seq, bwr_data->meta.bwr_sector, bwr_data->meta.dev_sector);
+		}
+		printk("[END]\n");
+	}
+}
+
+int __buffer_inuse_is_full(struct data_buffer *buffer)
+{
+	return buffer->inuse_size == buffer->maxsize;
 }
 
 int buffer_is_full(struct data_buffer *buffer)
@@ -26,6 +117,101 @@ int buffer_is_full(struct data_buffer *buffer)
         spin_unlock_irqrestore(&buffer->lock, flags);
 
 	return ret;
+}
+
+int buffer_inuse_is_full(struct data_buffer *buffer)
+{
+	int ret;
+        unsigned long flags;
+
+        spin_lock_irqsave(&buffer->lock, flags);
+	ret = __buffer_inuse_is_full(buffer);
+	spin_unlock_irqrestore(&buffer->lock, flags);
+
+	return ret;
+}
+
+int buffer_inuse_is_empty(struct data_buffer *buffer)
+{
+	int ret;
+        unsigned long flags;
+
+        spin_lock_irqsave(&buffer->lock, flags);
+	ret = buffer->inuse_head == NULL;
+        spin_unlock_irqrestore(&buffer->lock, flags);
+
+	return ret;
+}
+
+static inline void __buffer_inuse_size_inc(struct data_buffer *buffer)
+{
+	BUFFER_DEBUG("%s: inc inuse size from %lld ", __FUNCTION__, buffer->inuse_size);
+	if (buffer->inuse_size++ == buffer->maxsize) {
+		dump_buffer_inuse(buffer);
+		dump_buffer_data(buffer);
+		BUG();
+	}
+	BUFFER_DEBUG("to %lld\n", buffer->inuse_size);
+}
+
+static inline void __buffer_inuse_size_add(struct data_buffer *buffer, int nr)
+{
+	BUFFER_DEBUG("%s: add inuse size from %lld ", __FUNCTION__, buffer->inuse_size);
+	buffer->inuse_size += nr;
+	if (buffer->inuse_size > buffer->maxsize) {
+		dump_buffer_inuse(buffer);
+		dump_buffer_data(buffer);
+		BUG();
+	}
+	BUFFER_DEBUG("to %lld\n", buffer->inuse_size);
+}
+
+static inline void __buffer_inuse_size_sub(struct data_buffer *buffer, int nr)
+{
+	if (buffer->inuse_size < nr) {
+		dump_buffer_inuse(buffer);
+		dump_buffer_data(buffer);
+		BUG();
+	}
+	if (__buffer_inuse_is_full(buffer) && nr > 0) {
+		pr_info("buffer inuse size dec, notify not full.\n");
+		complete(&buffer->not_full);
+	}
+	BUFFER_DEBUG("%s: sub inuse size from %lld ", __FUNCTION__, buffer->inuse_size);
+	buffer->inuse_size -= nr;
+	BUFFER_DEBUG("to %lld\n", buffer->inuse_size);
+}
+
+static inline void __buffer_inuse_size_set(struct data_buffer *buffer, int nr)
+{
+	if (nr > buffer->maxsize || nr < 0) {
+		pr_err("%s try set buffer inuse size to %d.\n", __FUNCTION__, nr);
+		return;
+	}
+	if (__buffer_inuse_is_full(buffer) && nr != buffer->maxsize) {
+		pr_info("buffer inuse size set, notify not full.\n");
+		complete(&buffer->not_full);
+	}
+	BUFFER_DEBUG("%s: update inuse size from %lld ", __FUNCTION__, buffer->inuse_size);
+	buffer->inuse_size = nr;
+	BUFFER_DEBUG("to %lld\n", buffer->inuse_size);
+}
+
+static inline void __buffer_inuse_size_dec(struct data_buffer *buffer)
+{
+	BUFFER_DEBUG("%s: dec inuse size from %lld ", __FUNCTION__, buffer->inuse_size);
+	if (buffer->inuse_size == 0) {
+		dump_buffer_inuse(buffer);
+		dump_buffer_data(buffer);
+		BUG();
+	}
+
+	if (__buffer_inuse_is_full(buffer)) {
+		pr_info("buffer inuse size dec, notify not full.\n");
+		complete(&buffer->not_full);
+	}
+	buffer->inuse_size--;
+	BUFFER_DEBUG("to %lld\n", buffer->inuse_size);
 }
 
 struct data_buffer *init_data_buffer(uint64_t maxsize, void *private)
@@ -53,23 +239,15 @@ struct data_buffer *init_data_buffer(uint64_t maxsize, void *private)
 	spin_lock_init(&buffer->lock);
 	sema_init(&buffer->data_sema, 0);
 	init_completion(&buffer->not_full);
-	buffer->inuse_head = buffer->io_completed_tail = NULL;
+	buffer->tail_data = buffer->inuse_head = NULL;
 	buffer->data_size = 0;
 	buffer->inuse_size = 0;
 	buffer->maxsize = maxsize;
 	buffer->private = private;
-	buffer->io_completed_seq = 0 ;
 
 	return buffer;
 }
 
-/**
- *在下列情况下需要clear_data_buffer
- *1. primary变成secondary
- *2. 设备down或者模块卸载
- *3. 备机在P_DATA/P_RS_DATA之间切换
- *这些情况都不需要init sema
- */
 void clear_data_buffer(struct data_buffer *buffer)
 {
 	unsigned long flags;
@@ -83,12 +261,10 @@ void clear_data_buffer(struct data_buffer *buffer)
 		clear_bwr_data_inbuffer(bwr_data);
 		bwr_data_put(bwr_data);
 	}
-	buffer->inuse_head = NULL;
+	buffer->inuse_head = buffer->tail_data = NULL;
 	buffer->inuse_size = buffer->data_size = buffer->tail_seq = 0;
-	buffer->io_completed_tail = NULL ; 
-	buffer->io_completed_seq = 0 ; 
 	init_completion(&buffer->not_full);
-	//sema_init(&buffer->data_sema, 0);
+	sema_init(&buffer->data_sema, 0);
         spin_unlock_irqrestore(&buffer->lock, flags);
 }
 
@@ -120,18 +296,18 @@ struct bwr_data *get_find_data(struct data_buffer *buffer, sector_t disk_sector)
 
 	/* BUFFER_DEBUG("begin search for the buffer.search sector:%lu\n", disk_sector); */
         spin_lock_irqsave(&buffer->lock, flags);
-	list_for_each_entry_reverse(data_iter, &buffer->data_list,list) {
-		if(!buffer->inuse_head) {
-			break;
-		}
-		if (data_iter->meta.dev_sector == disk_sector) {
+	if (buffer->inuse_head) {
+		data_iter = buffer->tail_data;
+		for(;;) {
+			if (data_iter->meta.dev_sector == disk_sector) {
 				bwr_data = data_iter;
 				bwr_data_get(bwr_data);
 				break;
+			}
+			if (data_iter == buffer->inuse_head)
+				break;
+			data_iter = list_entry(data_iter->list.prev, struct bwr_data, list);
 		}
-		if (data_iter == buffer->inuse_head) 
-			break;
-
 	}
         spin_unlock_irqrestore(&buffer->lock, flags);
 
@@ -145,10 +321,12 @@ struct bwr_data *__get_buffer_next_data(struct data_buffer *buffer, struct bwr_d
 	if (!prev) {
 		pr_err("%s null prev.\n", __FUNCTION__);
 		dump_stack();
+		dump_buffer_inuse(buffer);
+		dump_buffer_data(buffer);
 		BUG();
 	}
 	if (__entry_in_buffer(buffer, prev)) {
-		if (prev != list_entry(buffer->data_list.prev,struct bwr_data, list)) {
+		if (prev != buffer->tail_data) {
 			bwr_data = list_entry(prev->list.next, struct bwr_data, list);
 			bwr_data_get(bwr_data);
 		}
@@ -168,72 +346,134 @@ struct bwr_data *get_buffer_next_data(struct data_buffer *buffer, struct bwr_dat
 	return bwr_data;
 }
 
-struct bwr_data *get_find_data_hash(struct data_buffer *buffer, sector_t disk_sector)
+struct bwr_data *__get_find_data_hash(struct data_buffer *buffer, sector_t disk_sector)
 {
-        unsigned long flags;
-        struct hlist_head *head = buffer->hash_list + data_hash(disk_sector);
+	struct hlist_head *head = buffer->hash_list + data_hash(disk_sector);
+        struct hlist_node *hash_iter;
 	struct bwr_data *data_iter;
 	struct bwr_data *bwr_data = NULL;
-	sector_t io_completed_seq ;
 
 	/* BUFFER_DEBUG("begin search for the buffer.search sector:%lu\n", disk_sector); */
-        spin_lock_irqsave(&buffer->lock, flags);
-	if(buffer->io_completed_tail) {
-		io_completed_seq = bwr_data_seq(buffer->io_completed_tail);
-	} else {
-		io_completed_seq = 1;
-	}
-        hlist_for_each_entry(data_iter, head, list_hash) {
+        hlist_for_each_entry(data_iter, hash_iter, head, list_hash) {
                 /* use the whole buffer */
-                if (data_iter->meta.dev_sector == disk_sector && 
-				data_iter->meta.bwr_seq <= io_completed_seq ) {
+                if (data_iter->meta.dev_sector == disk_sector) {
 			bwr_data = data_iter;
 			bwr_data_get(bwr_data);
 			break;
 		}
 	}
+
+	return bwr_data;
+}
+
+struct bwr_data *get_find_data_hash(struct data_buffer *buffer, sector_t disk_sector)
+{
+	unsigned long flags;
+	struct bwr_data *bwr_data = NULL;
+
+        spin_lock_irqsave(&buffer->lock, flags);
+	bwr_data = __get_find_data_hash(buffer, disk_sector);
         spin_unlock_irqrestore(&buffer->lock, flags);
 
 	return bwr_data;
 }
 
-static int __bwr_data_in_buffer(struct data_buffer *buffer, sector_t bwr_sector, sector_t prev_bwr_seq)
+/* for special case while the content may overlap
+ * @buffer
+ * @start:	start sector to search
+ * @len:	total search size. @len = HADM_SECTOR_SIZE * [1-4]
+ * */
+struct bwr_data **get_find_data_special(struct data_buffer *buffer,
+		sector_t start, int len)
 {
-	struct bwr_data *head_data, *tail_data;
+	int i, j;
+	int count, offset;
+	unsigned long flags;
+	struct bwr_data *result, *find;
+	struct bwr_data **rlist;
+	struct bwr_data **flist;
 
-	if (list_empty(&buffer->data_list))
-		return 0;
-	head_data = list_entry(buffer->data_list.next, struct bwr_data, list);
-	tail_data = list_entry(buffer->data_list.prev, struct bwr_data, list);
-	if(prev_bwr_seq) {
-		return (prev_bwr_seq + 1) >= head_data->meta.bwr_seq && 
-			(prev_bwr_seq + 1) <= tail_data->meta.bwr_seq  ;
-	}else {
-		return  sector_in_area(bwr_sector, head_data->meta.bwr_sector, tail_data->meta.bwr_sector);
+	count = PAGE_SIZE / HADM_SECTOR_SIZE + len / HADM_SECTOR_SIZE - 1;
+	flist = kzalloc(sizeof(struct bwr_data *) * count, GFP_KERNEL);
+	if (!flist) {
+		pr_info("%s alloc iter_result failed.\n", __func__);
+		return NULL;
 	}
+	rlist = kzalloc(sizeof(struct bwr_data *) * len / HADM_SECTOR_SIZE,
+			GFP_KERNEL);
+	if (!rlist) {
+		pr_info("%s: alloc result failed.\n", __func__);
+		kfree(flist);
+		return NULL;
+	}
+
+	//msleep(1000);
+	offset = (PAGE_SIZE / HADM_SECTOR_SIZE - 1);
+	spin_lock_irqsave(&buffer->lock, flags);
+	for (i = 0; i < count; i++) {
+		if ((start + i) < offset)
+			continue;
+		find = __get_find_data_hash(buffer, start + i - offset);
+		flist[i] = find;
+	}
+	spin_unlock_irqrestore(&buffer->lock, flags);
+
+	for (j = 0; j < len / HADM_SECTOR_SIZE; j++) {
+		result = NULL;
+		for (i = 0; i < PAGE_SIZE/HADM_SECTOR_SIZE; i++) {
+			find = flist[j + i];
+			if (find) {
+				if (!result ||
+				    bwr_data_seq(result) < bwr_data_seq(find))
+					result = find;
+			}
+		}
+		rlist[j] = result;
+		if (result)
+			bwr_data_get(result);
+	}
+
+	for (i = 0; i < count; i++) {
+		if (flist[i])
+			bwr_data_put(flist[i]);
+	}
+	kfree(flist);
+	return rlist;
 }
 
-struct bwr_data *get_find_data_by_bwr(struct data_buffer *buffer, sector_t bwr_sector, sector_t prev_bwr_seq)
+static int __bwr_data_in_buffer(struct data_buffer *buffer, sector_t bwr_sector)
+{
+	struct bwr_data *head_data;
+
+	if (!buffer->tail_data)
+		return 0;
+	head_data = list_entry(buffer->data_list.next, struct bwr_data, list);
+	return  sector_in_area(bwr_sector, head_data->meta.bwr_sector, buffer->tail_data->meta.bwr_sector);
+}
+
+struct bwr_data *get_find_data_by_bwr(struct data_buffer *buffer, sector_t bwr_sector)
 {
 	unsigned long flags;
 	struct list_head *head = &buffer->data_list;
 	struct bwr_data *data_iter;
 	struct bwr_data *bwr_data = NULL;
-	struct hadmdev *hadmdev = (struct hadmdev *)buffer->private;
 
+//	BUFFER_DEBUG("begin search for the buffer.search sector:%lu\n", bwr_sector);
 	spin_lock_irqsave(&buffer->lock, flags);
-	if (__bwr_data_in_buffer(buffer, bwr_sector, prev_bwr_seq)) {
+	if (__bwr_data_in_buffer(buffer, bwr_sector)) {
 		list_for_each_entry(data_iter, head, list) {
-			if ((prev_bwr_seq && data_iter->meta.bwr_seq == prev_bwr_seq + 1) ||
-					(!prev_bwr_seq && data_iter->meta.bwr_sector == bwr_sector)) {
+			//BUFFER_DEBUG("iter: bwr_sector:%lu, disk_sector:%lu.\n", data_iter->meta.bwr_sector, data_iter->meta.dev_sector);
+			if (data_iter->meta.bwr_sector == bwr_sector) {
 				bwr_data = data_iter;
 				bwr_data_get(bwr_data);
 				break;
 			}
 		}
 		if (!bwr_data) {
-			pr_err("%s: BUG!!! hadm%d get bwr_data %lu failed while sector in [head, tail]\n", __FUNCTION__,
-					hadmdev->minor, bwr_sector);
+			pr_err("%s: BUG!!! get bwr_data %lu failed while sector in [head, tail]\n", __FUNCTION__,
+					bwr_sector);
+			dump_buffer_inuse(buffer);
+			dump_buffer_data(buffer);
 			BUG();
 		}
 	}
@@ -241,72 +481,183 @@ struct bwr_data *get_find_data_by_bwr(struct data_buffer *buffer, sector_t bwr_s
 	return bwr_data;
 }
 
-struct bwr_data *get_find_data_inuse(struct data_buffer *buffer, sector_t disk_sector)
+struct bwr_data *get_find_data_inuse(struct data_buffer *buffer,
+		sector_t disk_sector, int len)
 {
 
-        return get_find_data_hash(buffer, disk_sector);
+	if (likely(len == PAGE_SIZE))
+		return get_find_data_hash(buffer, disk_sector);
+	else {
+		int i;
+		int count = len >> HADM_SECTOR_SHIFT;
+		struct bwr_data *data = NULL;
+		struct bwr_data **rlist;
 
-	/* FIXME why need bwr_data->list_inuse.next */
-        //if (bwr_data && bwr_data->list_inuse.next)
-                //return bwr_data;
+		pr_info("%s: warning special len %d. sector:%lu.\n", __func__,
+				len, disk_sector);
+		rlist = get_find_data_special(buffer, disk_sector, len);
+		if (!rlist)
+			return NULL;
+		for (i = 0; i < count; i++) {
+			if (rlist[0] != rlist[i]) {
+				pr_info("%s: badly! data:(%p:%lu)(%p:%lu).\n",
+						__func__,
+						rlist[0], rlist[0] ? rlist[0]->meta.dev_sector : -1,
+						rlist[i], rlist[i] ? rlist[i]->meta.dev_sector : -1);
+
+				goto free_list;
+			}
+		}
+		data = rlist[0];
+		if (data)
+			bwr_data_get(data);
+		pr_info("%s: lucky? sector:(%lu:%lu), len:%d.\n",
+				__func__, disk_sector,
+				data ? data->meta.dev_sector : -1, len);
+free_list:
+		for (i = 0; i < count; i++) {
+			if (rlist[i])
+				bwr_data_put(rlist[i]);
+		}
+		kfree(rlist);
+
+		return data;
+	}
 }
 
 /* return 0 if have truncated, -1 else. */
 static int __buffer_trunc(struct data_buffer *buffer)
 {
-	struct bwr_data *bwr_data, *tail_data;
-	if(list_empty(&buffer->data_list)) {
-		pr_info("%s: hadm%d trunc a empty buffer\n",__FUNCTION__, get_hadmdev_minor_from_buffer(buffer));
-		return -1;
-		//dump_stack();
-		//BUG();
-	}
-		
-	tail_data = list_entry(buffer->data_list.prev, struct bwr_data, list);
-
+	struct bwr_data *bwr_data;
 
 	bwr_data = list_first_entry(&buffer->data_list, struct bwr_data, list);
-	/**
-	 *只有当buffer的第一个元素的seq <= io_completed_seq 才能被trunc
-	 */
-	if (bwr_data != buffer->inuse_head && 
-			bwr_data_seq(bwr_data) <= buffer->io_completed_seq) {
+	if (bwr_data != buffer->inuse_head) {
 		buffer->data_size--;
-		if (unlikely(bwr_data == tail_data)) {
-			BUFFER_DEBUG("%s warning: buffer is full, try trunc tail_data.\n", __FUNCTION__);
-			buffer_set_tail_seq(buffer, bwr_data->meta.bwr_seq);
-		}
-		if(bwr_data == buffer->io_completed_tail) {
-			buffer->io_completed_tail = NULL;
-		}
-
 		list_del_init(&bwr_data->list);
 		clear_bwr_data_inbuffer(bwr_data);
+		if (unlikely(bwr_data == buffer->tail_data)) {
+			BUFFER_DEBUG("%s warning: buffer is full, try trunc tail_data.\n", __FUNCTION__);
+			buffer_set_tail_seq(buffer, bwr_data->meta.bwr_seq);
+			buffer->tail_data = NULL;
+		}
+		BUFFER_DEBUG("%s trunc %llu(%lu:%lu)\n", __FUNCTION__,
+				bwr_data_seq(bwr_data), bwr_data->meta.bwr_sector, bwr_data->meta.dev_sector);
 		bwr_data_put(bwr_data);
 		return 0;
-	}else {
-		BUFFER_DEBUG("%s: buffer is all in use, trunc failed. buffer first entry = %p, inuse_head = %p, io_completed_tail = %p , io_completed_seq = %llu\n",
-				__FUNCTION__, bwr_data, buffer->inuse_head, buffer->io_completed_tail,
-				(unsigned long long)buffer->io_completed_seq);
-		BUFFER_DEBUG("%s: first entry %p ,seq %llu, sync_node_mask %llu\n",
-				__FUNCTION__, bwr_data, bwr_data->meta.bwr_seq, 
-				bwr_data->private ? ((struct bio_wrapper *)bwr_data->private)->sync_node_mask:0);
-		return -1;
 	}
+	return -1;
 }
 
-/* FIXME: warning: need inuse size? increase?...*/
 static void __buffer_inuse_add_tail(struct data_buffer *buffer, struct bwr_data *bwr_data)
 {
+	struct hadmdev *dev;
 	if (!bwr_data)
 		return;
-	if (! buffer->inuse_head) {
-		buffer->inuse_head = bwr_data;
+	if (bwr_data->private) {
+		dev = buffer->private;
+		dev->acct_info[W_BIO_FINISH]++;
+		if (bwr_data_remote(bwr_data)) {
+			IO_DEBUG("%s: remote write %lu finish.\n", __func__,
+					bwr_data->meta.dev_sector);
+			hadmdev_sbio_packet_end(dev, bwr_data->private, 0);
+			//hadmdev_sbio_finish(bwr_data->private, 0) FIXME
+		} else
+			bio_endio(bwr_data->private, 0);
+		bwr_data->private = NULL;
+	}
+	if (buffer->inuse_head)
+		buffer->tail_data = bwr_data;
+	else {
+		buffer->inuse_head = buffer->tail_data = bwr_data;
 	}
 	set_bwr_data_seqinbuffer(bwr_data);
 	up(&buffer->data_sema);
 }
 
+static int __buffer_data_seq_add(struct data_buffer *buffer, struct bwr_data *bwr_data)
+{
+	int count = 0;
+	struct bwr_data *data_iter;
+	struct hlist_head *hash_head;
+	uint64_t last_seq;
+
+	if (buffer->tail_data == NULL) {
+		BUFFER_DEBUG("tail_data is NULL, take buffer->tail_seq:%llu\n", buffer->tail_seq);
+		last_seq = buffer->tail_seq;
+	} else
+		last_seq = buffer->tail_data->meta.bwr_seq;
+	if (unlikely(bwr_data_seq(bwr_data) <= last_seq)) {
+		pr_err("BUG %s can not find postion to insert %llu(%lu:%lu), tail:%llu(%lu:%lu)\n",
+				__FUNCTION__,
+				bwr_data->meta.bwr_seq, bwr_data->meta.bwr_sector, bwr_data->meta.dev_sector,
+				buffer->tail_data ? buffer->tail_data->meta.bwr_seq : buffer->tail_seq,
+				buffer->tail_data ? buffer->tail_data->meta.bwr_sector: 0,
+				buffer->tail_data ? buffer->tail_data->meta.dev_sector: 0);
+		dump_buffer_inuse(buffer);
+		dump_buffer_data(buffer);
+		bwr_data_put(bwr_data);
+		BUG();
+	}
+
+	set_bwr_data_inbuffer(bwr_data);
+	if (bwr_data_seq(bwr_data) == ++last_seq) {
+		if (likely(buffer->tail_data))
+			list_add(&bwr_data->list, &buffer->tail_data->list);
+		else
+			__list_add(&bwr_data->list, &buffer->data_list, buffer->data_list.next);
+
+		hash_head = buffer->hash_list + data_hash(bwr_data->meta.dev_sector);
+		hlist_add_head(&bwr_data->list_hash, hash_head);
+		__buffer_inuse_add_tail(buffer, bwr_data);
+		count++;
+		data_iter = bwr_data;
+		list_for_each_entry_continue(data_iter, &buffer->data_list, list) {
+			if (data_iter->meta.bwr_seq != ++last_seq)
+				break;
+			hash_head = buffer->hash_list + data_hash(data_iter->meta.dev_sector);
+			hlist_add_head(&data_iter->list_hash, hash_head);
+			__buffer_inuse_add_tail(buffer, data_iter);
+			count++;
+		}
+		BUFFER_DEBUG("bufer inuse add seq. sector:%lu.\n", bwr_data->meta.dev_sector);
+	} else {
+		list_for_each_entry_reverse(data_iter, &buffer->data_list, list) {
+			/*  tail_data == NULL; then inuse_list is empty, search the whole list.
+			 *  tail_data != NULL; whether inuse_list is empty or not, reverse search until tail_data.
+			 */
+			if (data_iter->meta.bwr_seq < bwr_data->meta.bwr_seq) {
+				list_add(&bwr_data->list, &data_iter->list);
+				BUFFER_DEBUG("buffer inuse add after %llu(%lu:%lu). not-empty & not seq.\n",
+						bwr_data_seq(data_iter), data_iter->meta.bwr_sector,
+						data_iter->meta.dev_sector);
+				return 0;
+			}
+		}
+
+		/* add at first */
+		BUFFER_DEBUG("buffer inuse add at head, next entry: %llu(%lu:%lu). not-empty & not seq.\n",
+				bwr_data_seq(data_iter), data_iter->meta.bwr_sector,
+				data_iter->meta.dev_sector);
+		__list_add(&bwr_data->list, &buffer->data_list, buffer->data_list.next);
+		return 0;
+	}
+	return count;
+}
+
+/* Note: deprecate? inuse_size, buffer_size?*/
+int buffer_data_seq_add(struct data_buffer *buffer, struct bwr_data *bwr_data)
+{
+	int ret;
+        unsigned long flags;
+
+        spin_lock_irqsave(&buffer->lock, flags);
+	ret = __buffer_data_seq_add(buffer, bwr_data);
+        spin_unlock_irqrestore(&buffer->lock, flags);
+	if (ret < 0)
+		pr_err("%s add fail.\n", __FUNCTION__);
+
+	return ret;
+}
 
 struct bwr_data *get_head_data_inuse(struct data_buffer *buffer)
 {
@@ -321,6 +672,25 @@ struct bwr_data *get_head_data_inuse(struct data_buffer *buffer)
 	return head_data;
 }
 
+struct bwr_data *__get_tail_data_inuse(struct data_buffer *buffer)
+{
+	struct bwr_data *tail_data;
+	tail_data = buffer->inuse_head ? buffer->tail_data : NULL;
+	if (tail_data)
+		bwr_data_get(tail_data);
+	return tail_data;
+}
+
+struct bwr_data *get_tail_data_inuse(struct data_buffer *buffer)
+{
+	struct bwr_data *tail_data;
+        unsigned long flags;
+
+        spin_lock_irqsave(&buffer->lock, flags);
+	tail_data = __get_tail_data_inuse(buffer);
+	spin_unlock_irqrestore(&buffer->lock, flags);
+	return tail_data;
+}
 
 /*
  * increase size before add the element,
@@ -329,270 +699,181 @@ struct bwr_data *get_head_data_inuse(struct data_buffer *buffer)
 void buffer_inuse_pre_occu(struct data_buffer *buffer)
 {
         unsigned long flags;
-	int ret ; 
-	int inited = 0; 
 
 try_occupy:
         spin_lock_irqsave(&buffer->lock, flags);
-	if (buffer->data_size == buffer->maxsize ) {
+
+	if (__buffer_inuse_is_full(buffer)) {
+                spin_unlock_irqrestore(&buffer->lock, flags);
+		//pr_info("occu try wait.\n");
+		wait_for_completion(&buffer->not_full);
+		goto try_occupy;
+	}
+
+	if (buffer->data_size == buffer->maxsize) {
 		BUFFER_DEBUG("%s: buffer is full, try trunc data.\n", __FUNCTION__);
-		ret = __buffer_trunc(buffer) ; 
-		if (ret < 0) {
+		if (__buffer_trunc(buffer) < 0) {
+			dump_buffer_inuse(buffer);
+			dump_buffer_data(buffer);
 			spin_unlock_irqrestore(&buffer->lock, flags);
-			if(!inited) {
-				init_completion(&buffer->not_full);
-				inited  = 1; 
-			}
-
-			if(wait_for_completion_timeout(&buffer->not_full,msecs_to_jiffies(10000)) == 0){
-				pr_warn("%s: hadm%d buffer is full ,wait free space timeout\n",
-						__FUNCTION__, get_hadmdev_minor_from_buffer(buffer));
-				/**
-				 *如果需要同步的节点非常多，可能会超时,也许需要将某些同步节点设置为ASYNC模式
-				 */
-				//BUG();
-			}
-			goto try_occupy;
-		}else {
+			pr_err("%s BUG have no space for truncate.\n", __FUNCTION__);
+			BUG();
 		}
-
 	}
+	//buffer->inuse_size++;
+	__buffer_inuse_size_inc(buffer);
 	buffer->data_size++;
-	BUFFER_DEBUG("pre occu:data_size:%llu|maxsize:%llu.\n",
-			buffer->data_size, 
-			buffer->maxsize);
+	BUFFER_DEBUG("pre occu:inuse_size:%llu|data_size:%llu.\n",
+			buffer->inuse_size,
+			buffer->data_size);
 	spin_unlock_irqrestore(&buffer->lock, flags);
 }
 
-
-void buffer_add_bwr_data(struct data_buffer *buffer, struct bwr_data *bwr_data)
+void buffer_inuse_del_occd(struct data_buffer *buffer)
 {
-	unsigned long flags;
-        struct hlist_head *hash_head;
-	spin_lock_irqsave(&buffer->lock,  flags);
-	list_add(&bwr_data->list, &buffer->data_list);
-	hash_head  =  buffer->hash_list + data_hash(bwr_data->meta.dev_sector);
-	hlist_add_head(&bwr_data->list_hash, hash_head);
-	buffer->tail_seq++;
-	buffer->data_size++;
-	__buffer_inuse_add_tail(buffer, bwr_data);
-	spin_unlock_irqrestore(&buffer->lock,  flags);
+        unsigned long flags;
 
-
-}
-void buffer_add_bio_wrapper(struct bio_wrapper *bio_wrapper)
-{
-	struct hadmdev *hadmdev = bio_wrapper->hadmdev;
-	struct data_buffer *buffer = hadmdev->buffer;
-	struct bio_struct *bio_struct;
-	struct bwr_data *bwr_data;
-	struct page *page;
-	uint64_t bwr_data_seq = 0, _bwr_seq = 0;
-	int count = 0;
-	if(hadmdev_error(hadmdev)){
-		return;
-	}
-	_bwr_seq = bwr_seq(hadmdev->bwr);
-	list_for_each_entry(bio_struct, &bio_wrapper->bio_list, list) {
-		count++;
-		bwr_data = bio_struct->private;
-		page = bio_struct->bio->bi_io_vec[1].bv_page;
-		get_page(page);
-		bwr_data->data_page = page;
-		set_page_private(page,  (unsigned long)bwr_data);
-		buffer_data_add(buffer, bwr_data);
-		bwr_data_seq = bwr_data_seq(bwr_data);
-	}
-
-	if(count && bwr_data_seq != _bwr_seq + count) {
-		pr_warn("%s: hadm%d bwr data in buffer 's seq(%llu) is mismatch with the seq(%llu) written to primary info, count = %d\n",
-				__FUNCTION__, hadmdev->minor, 
-				(unsigned long long)bwr_data_seq, (unsigned long long)_bwr_seq, count);
-		hadmdev_set_error(hadmdev, __BWR_ERR);
-		return;
-
-	}else{
-		BUFFER_DEBUG("%s:add %d bwr data to buffer, last bwr data seq = %llu, _bwr_seq = %llu\n",
-				__FUNCTION__, count,
-				(unsigned long long)bwr_data_seq, (unsigned long long)_bwr_seq);
-	}
-	bwr_add_seq_n_tail(hadmdev->bwr, count);
-	if(count) {
-		complete(&hadmdev->bwr->have_snd_data);
-	}
+        spin_lock_irqsave(&buffer->lock, flags);
+	buffer->data_size--;
+	__buffer_inuse_size_dec(buffer);
+//	BUFFER_DEBUG("del occu:inuse_size:%llu|data_size:%llu.\n",
+//			buffer->inuse_size,
+//			buffer->data_size);
+        spin_unlock_irqrestore(&buffer->lock, flags);
 }
 
-void buffer_set_io_completed_seq(struct data_buffer *buffer, sector_t seq)
+int buffer_data_seq_add_occd(struct data_buffer *buffer, struct bwr_data *bwr_data)
 {
-	unsigned long flags;
-	spin_lock_irqsave(&buffer->lock, flags);
-	_buffer_set_io_completed_seq(buffer, seq);
-	spin_unlock_irqrestore(&buffer->lock, flags);
-}
+	int ret;
+        unsigned long flags;
 
-void buffer_set_io_completed(struct bio_wrapper *bio_wrapper)
-{
-	struct hadmdev *hadmdev = bio_wrapper->hadmdev;
-	struct data_buffer *buffer = hadmdev->buffer;
-	struct bio_struct *bio_struct;
-	unsigned long flags;
-	BUFFER_DEBUG("%s:set io completed for bio_wrapper %p\n",
-			__FUNCTION__,bio_wrapper);
-	spin_lock_irqsave(&buffer->lock, flags);
-	list_for_each_entry(bio_struct, &bio_wrapper->bio_list, list) {
-		/**
-		 *bio_struct->private 指向bwr_data，当备机处理P_RS_DATA时，因为
-		 *直接写到bdev上，所以bio_struct->private == NULL时，就不处理了
-		 */
-		if(bio_struct->private == NULL) {
-			break;
-		}
-		if(buffer->io_completed_tail == NULL) {
-			buffer->io_completed_tail = list_entry(buffer->data_list.next, struct bwr_data, list);
-		}else {
-			buffer->io_completed_tail = list_entry(buffer->io_completed_tail->list.next, struct bwr_data, list) ;
-		}
-		BUFFER_DEBUG("%s:set io completed for bio_wrapper %p,  bio_struct %p(private %p), io_completed_tail %p, bwr_seq %llu\n",
-				__FUNCTION__, 
-				bio_wrapper, bio_struct, bio_struct->private, buffer->io_completed_tail,
-				(unsigned long long)buffer->io_completed_tail->meta.bwr_seq);
-
-		if (unlikely(buffer->io_completed_tail != bio_struct->private)) { 
-			pr_warn("mismatch\n");
-			hadmdev_set_error(hadmdev, __BWR_ERR);
-			goto out;
-		}
-		if(unlikely(buffer->io_completed_seq &&
-				       	bwr_data_seq(buffer->io_completed_tail) != 
-					buffer->io_completed_seq +1)) {
-			pr_warn("%s:hadm%d bwr_seq io completed seq mismatched, io_completed_tail = %llu, expected = %llu \n",
-					__FUNCTION__, hadmdev->minor, 
-					(unsigned long long)bwr_data_seq(buffer->io_completed_tail),
-					(unsigned long long)buffer->io_completed_seq +1);
-			hadmdev_set_error(hadmdev, __BWR_ERR);
-			goto out;
-		
-		}
-				
-		_buffer_set_io_completed_seq(buffer, bwr_data_seq(buffer->io_completed_tail));
-		complete(&buffer->not_full);
-
+        spin_lock_irqsave(&buffer->lock, flags);
+	if ((ret = __buffer_data_seq_add(buffer, bwr_data)) < 0) {
+		pr_info("%s: BUG \n", __FUNCTION__);
+		dump_stack();
+		dump_buffer_inuse(buffer);
+		BUG();
 	}
-out:
-	spin_unlock_irqrestore(&buffer->lock, flags);
+
+	BUFFER_DEBUG("%s: buffer add occd: %llu(%lu|%lu) in %d count.\n", __FUNCTION__,
+			bwr_data->meta.bwr_seq,
+                        bwr_data->meta.bwr_sector, bwr_data->meta.dev_sector,
+			ret);
+	//dump_buffer_inuse(buffer);
+	//dump_buffer_data(buffer);
+        spin_unlock_irqrestore(&buffer->lock, flags);
+
+	return ret;
 }
 
-/**
- *FIXME 可能存在的问题，如果两个写bdev的io返回，那么在循环里获得
- *的next_entry有可能在buffer_trunc里被删除
- */
-static int __buffer_inuse_del(struct data_buffer *buffer, 
-		struct bwr_data *entry, 
-		struct bwr_data **next_entry,
-		struct bio_wrapper **completed_bio_wrapper)
+static int __buffer_inuse_del(struct data_buffer *buffer, struct bwr_data *entry)
 {
 	int count = 0;
 
-	if(IS_ERR_OR_NULL(entry) || !bwr_data_synced(entry) ){
-		return 0;
-	}	
-	*completed_bio_wrapper = NULL;
-	*next_entry = NULL;
-
+	BUFFER_DEBUG("%s try del %llu(%lu:%lu)...\n", __FUNCTION__,
+			bwr_data_seq(entry), entry->meta.bwr_sector, entry->meta.dev_sector);
+	set_bwr_data_synced(entry);
 	if (entry == buffer->inuse_head) {
-		list_for_each_entry_from(entry, &buffer->data_list, list) {
+		BUFFER_DEBUG("%s entry is inuse head, forward search...\n", __FUNCTION__);
+		while (entry != buffer->tail_data) {
 			if (!bwr_data_synced(entry))
 				break;
 			hlist_del_init(&entry->list_hash);
 			set_bwr_data_seqsynced(entry);
-			count ++;
+			entry = list_entry(entry->list.next, struct bwr_data, list);
+		}
 
-			/**
-			 *在sync模式里，当本地bdev写入数据完成后，需要清除掉对应的sync_node_mask
-			 *并触发sync_mask_clear_node对应的操作
-			 */
-			if(entry->private) {
-				/**
-				 *因为sync_mask_clear_node会触发end_io操作，在end_io里，会对buffer加锁
-				 *并设置io_completed_tail，所以会发生死锁，这里先将需要清理的bio_wrapper
-				 *加入到队列里，然后再锁外clear
-				 *使用队列的话，会使用kzalloc，导致“scheduling while atomic"的问题
-				 *所以现在改用如果有completed_bio_wrapper出现，立即返回
-				 */
-				*completed_bio_wrapper = (struct bio_wrapper *)entry->private;
-				*next_entry = list_entry(entry->list.next, struct bwr_data, list);
-				break;
-			}
-		}
-		if(*next_entry) {
-		       if( &(*next_entry)->list != &buffer->data_list) {
-			       buffer->inuse_head = *next_entry;
-		       }else {
-			       buffer->inuse_head = NULL;
-			       *next_entry = NULL;
-		       }
-		} else if( &entry->list != &buffer->data_list) {
-			buffer->inuse_head = entry; 
-		}else {
+		BUFFER_DEBUG("%s search end at %llu(%lu:%lu)...\n", __FUNCTION__,
+				bwr_data_seq(entry), entry->meta.bwr_sector, entry->meta.dev_sector);
+		count = bwr_data_seq(entry) - bwr_data_seq(buffer->inuse_head);
+		if (bwr_data_synced(entry)) {
+			count++;
+			set_bwr_data_seqsynced(entry);
 			buffer->inuse_head = NULL;
+			hlist_del_init(&entry->list_hash);
+		} else {
+			buffer->inuse_head = entry;
 		}
+		BUFFER_DEBUG("%s count = %d, update inuse_head to %llu(%lu:%lu).\n", __FUNCTION__,
+				count,
+				buffer->inuse_head ? bwr_data_seq(buffer->inuse_head) : 0,
+				buffer->inuse_head ? buffer->inuse_head->meta.bwr_sector : 0,
+				buffer->inuse_head ? buffer->inuse_head->meta.dev_sector: 0);
+		__buffer_inuse_size_sub(buffer, count);
 	}
-	if(count){
-		complete(&buffer->not_full);
-	}
+	//dump_buffer_inuse(buffer);
+	//dump_buffer_data(buffer);
 	return count;
 }
 
 int buffer_inuse_del(struct data_buffer *buffer, struct bwr_data *entry)
 {
-	int count, total = 0;
-	struct bio_wrapper *completed_bio_wrapper;
-	struct bwr_data *next_entry;
-	int local_node_id = get_node_id();
+	int count;
+        unsigned long flags;
+        sector_t disk_sector = entry->meta.dev_sector;
 
         if (!entry) {
-                pr_info("hadm%d try del null inuse entry.\n", get_hadmdev_minor_from_buffer(buffer));
+                pr_info("try del null inuse entry.\n");
                 return -1;
         }
 
+	spin_lock_irqsave(&buffer->lock, flags);
 	/* FIXME */
-	spin_lock(&buffer->lock);
-	if (unlikely(!__entry_in_inuse(buffer, entry))) {
-		spin_unlock(&buffer->lock);
+	if (likely(__entry_in_inuse(buffer, entry))) {
+		count = __buffer_inuse_del(buffer, entry);
+	} else {
+		pr_info("BUG!!!!!!!!!!!!!!!!!!!!!!!try del non-inuse entry:%llu(%lu:%lu).\n",
+				entry->meta.bwr_seq, entry->meta.bwr_sector, entry->meta.dev_sector);
+		dump_buffer_inuse(buffer);
+		dump_buffer_data(buffer);
+		spin_unlock_irqrestore(&buffer->lock, flags);
 		return -1;
+                //BUG();
 	}
-	set_bwr_data_synced(entry);
-	while(1) {
-		completed_bio_wrapper = NULL;
-		next_entry = NULL;
-		count = __buffer_inuse_del(buffer, entry, &next_entry, &completed_bio_wrapper);
-		spin_unlock(&buffer->lock);
-		total += count;
-		if(count == 0 || completed_bio_wrapper ==NULL ){
-			break;
-		}
-		entry = next_entry;
-		sync_mask_clear_node(completed_bio_wrapper, local_node_id, 0);
-		if(entry == NULL) {
-			break;
-		}
-		spin_lock(&buffer->lock);
-	}
-
-	return total;
+	BUFFER_DEBUG("inuse del:disk_sector:%lu|inuse_size:%llu|data_size:%llu.\n",
+                        disk_sector,
+			buffer->inuse_size,
+			buffer->data_size);
+	spin_unlock_irqrestore(&buffer->lock, flags);
+	return count;
 }
 
 /* add tail */
 static int __buffer_data_add(struct data_buffer *buffer, struct bwr_data *bwr_data)
 {
-	struct hlist_head *hash_head;
-	set_bwr_data_inbuffer(bwr_data);
-	list_add_tail(&bwr_data->list, &buffer->data_list);
+        struct hlist_head *hash_head;
 
+	if (__buffer_inuse_is_full(buffer)) {
+		pr_info("%s buffer is full.\n", __FUNCTION__);
+		return -1;
+	}
+
+	if (buffer->data_size == buffer->maxsize) {
+		BUFFER_DEBUG("%s: buffer is full, try trunc data.\n", __FUNCTION__);
+		if (__buffer_trunc(buffer) < 0) {
+			dump_buffer_inuse(buffer);
+			dump_buffer_data(buffer);
+			pr_err("%s BUG have no space for truncate.\n", __FUNCTION__);
+			BUG();
+		}
+	}
+
+	bwr_data_get(bwr_data);
+	set_bwr_data_inbuffer(bwr_data);
+	__buffer_inuse_size_inc(buffer);
+	buffer->data_size++;
+
+	if (likely(buffer->tail_data))
+		list_add(&bwr_data->list, &buffer->tail_data->list);
+	else
+		__list_add(&bwr_data->list, &buffer->data_list, buffer->data_list.next);
 	hash_head = buffer->hash_list + data_hash(bwr_data->meta.dev_sector);
 	hlist_add_head(&bwr_data->list_hash, hash_head);
-
 	__buffer_inuse_add_tail(buffer, bwr_data);
+
+	BUFFER_DEBUG("pre occu:inuse_size:%llu|data_size:%llu.\n",
+			buffer->inuse_size,
+			buffer->data_size);
 	return 0;
 }
 

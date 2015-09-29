@@ -33,23 +33,11 @@ void hadm_list_del(struct hadm_struct *hadm, struct hadmdev *dev)
 	atomic_dec(&hadm->dev_list_len);
 }
 
-int hadm_devs_empty(struct hadm_struct *hadm)
-{
-	int ret;
-
-	read_lock(&g_hadm->dev_list_lock);
-	ret = list_empty(&g_hadm->dev_list);
-	read_unlock(&g_hadm->dev_list_lock);
-
-	return ret;
-}
-
 struct hadmdev *find_hadmdev_by_minor(int minor)
 {
 	struct hadmdev *dev,*rdev;
-	unsigned long flags;
 	rdev=NULL;
-	read_lock_irqsave(&g_hadm->dev_list_lock, flags);
+	read_lock(&g_hadm->dev_list_lock);
 	if(list_empty(&g_hadm->dev_list)) {
 		goto find_out;
 	}
@@ -61,18 +49,16 @@ struct hadmdev *find_hadmdev_by_minor(int minor)
 		}
 	}
 find_out:
-	read_unlock_irqrestore(&g_hadm->dev_list_lock, flags);
+	read_unlock(&g_hadm->dev_list_lock);
 	return rdev;
 }
 
-int hadm_reconfig(struct hadm_struct *hadm, char *serverip, char *serverport,
-		int local_node_id, int local_kmod_id)
+void hadm_disconnect(struct hadm_struct *hadm)
 {
-	hadm->local_node_id = local_node_id;
-	hadm->local_kmod_id = local_kmod_id;
-	//FIXME server port? server ip
+	struct hadmdev *dev_iter;
 
-	return 0;
+	list_for_each_entry(dev_iter, &g_hadm->dev_list, node)
+		hadmdev_disconnect_all(dev_iter);
 }
 
 int hadm_get_config_count(struct hadm_struct *hadm)
@@ -90,33 +76,14 @@ void hadm_put(struct hadm_struct *hadm)
 	struct hadmdev *dev, *tmp;
 	int i=0;
 
+	if (hadm->cmd_server_sock)
+		hadm_socket_close(hadm->cmd_server_sock);
+	hadm_net_shutdown(hadm->ctrl_net, SHUT_RDWR);
+	hadm_net_shutdown(hadm->data_net, SHUT_RDWR);
+
 	hadm_queue_freeze_all(hadm->cmd_receiver_queue);
-	hadm_queue_freeze_all(hadm->cmd_sender_queue);
-	hadm_socket_close(hadm->cmd_server_sock);
-	hadm_net_close(hadm->data_net);
-	hadm_net_close(hadm->ctrl_net);
-	if(!IS_ERR_OR_NULL(hadm->cmd_worker)) {
-		hadm_thread_stop(hadm->cmd_worker);
-		hadm_thread_join(hadm->cmd_worker);
-		hadm_thread_free(&hadm->cmd_worker);
-	}
-	for(i=0;i<P_TYPE_NUM;i++) {
-			hadm_thread_stop(hadm->p_receiver[i]);
-			hadm_thread_stop(hadm->p_sender[i]);
-	}
-	for(i=0;i<P_TYPE_NUM;i++) {
-			hadm_thread_join(hadm->p_receiver[i]);
-			hadm_thread_free(&hadm->p_receiver[i]);
-			hadm_thread_join(hadm->p_sender[i]);
-			hadm_thread_free(&hadm->p_sender[i]);
-	}
-
-	hadm_socket_release(hadm->cmd_server_sock);
-	hadm_net_release(hadm->ctrl_net);
-	hadm_net_release(hadm->data_net);
-
-	hadm_pack_queue_clean(hadm->cmd_receiver_queue);
-	hadm_pack_queue_clean(hadm->cmd_sender_queue);
+	for (i = 0; i < P_TYPE_NUM; i++)
+		hadm_queue_freeze_all(hadm->p_sender_queue[i]);
 
 	write_lock(&g_hadm->dev_list_lock);
 	list_for_each_entry_safe(dev, tmp, &hadm->dev_list, node) {
@@ -127,9 +94,34 @@ void hadm_put(struct hadm_struct *hadm)
 	}
 	write_unlock(&g_hadm->dev_list_lock);
 
+	if(!IS_ERR_OR_NULL(hadm->cmd_worker)) {
+		hadm_thread_stop(hadm->cmd_worker);
+		hadm_thread_free(&hadm->cmd_worker);
+	}
+	for(i=0;i<P_TYPE_NUM;i++) {
+		if ( ! IS_ERR_OR_NULL(hadm->p_sender[i])) {
+			hadm_thread_stop(hadm->p_sender[i]);
+			hadm_thread_free(&hadm->p_sender[i]);
+		}
+		if ( ! IS_ERR_OR_NULL(hadm->p_receiver[i])) {
+			hadm_thread_stop(hadm->p_receiver[i]);
+			hadm_thread_free(&hadm->p_receiver[i]);
+		}
+	}
+
+	for(i=0;i<P_TYPE_NUM;i++) {
+		hadm_pack_queue_clean(hadm->p_sender_queue[i]);
+	}
+	hadm_pack_queue_clean(hadm->cmd_receiver_queue);
+	hadm_socket_release(hadm->cmd_server_sock);
+	hadm_net_release(hadm->ctrl_net);
+	hadm_net_release(hadm->data_net);
+
 	/* free queue */
+	for (i=0; i<P_TYPE_NUM; i++) {
+		hadm_queue_free(hadm->p_sender_queue[i]);
+	}
 	hadm_queue_free(hadm->cmd_receiver_queue);
-	hadm_queue_free(hadm->cmd_sender_queue);
 	if (hadm->major > 0)
 		unregister_blkdev(hadm->major, HADMDEV_NAME);
 
@@ -138,7 +130,7 @@ void hadm_put(struct hadm_struct *hadm)
 	pr_info("hadm module is unloaded\n");
 }
 
-struct hadm_struct *hadm_alloc(const char *hadm_server_ipaddr, const int hadm_server_port, int gfp_mask)
+struct hadm_struct *hadm_alloc(int gfp_mask)
 {
 	struct hadm_struct *hadm;
 	int i = 0;
@@ -147,12 +139,12 @@ struct hadm_struct *hadm_alloc(const char *hadm_server_ipaddr, const int hadm_se
 	if (hadm == NULL)
 		return ERR_PTR(-ENOMEM);
 
-	hadm->data_net = hadm_net_create(hadm_server_ipaddr, hadm_server_port, gfp_mask);
-	hadm->ctrl_net = hadm_net_create(hadm_server_ipaddr, hadm_server_port, gfp_mask);
+	hadm->data_net = hadm_net_create(gfp_mask);
+	hadm->ctrl_net = hadm_net_create(gfp_mask);
 
 	hadm->cmd_receiver_queue = hadm_queue_alloc();
-	hadm->cmd_sender_queue = hadm_queue_alloc();
 	for (i = 0; i < P_TYPE_NUM; i++) {
+		hadm->p_sender_queue[i] = hadm_queue_alloc();
 		hadm->p_receiver[i] = hadm_thread_alloc();
 		hadm->p_sender[i] = hadm_thread_alloc();
 	}
@@ -175,26 +167,24 @@ static struct hadm_thread_info hadm_receiver_threads[] = {
 
 static char *get_ptype_name(int p_type)
 {
-	switch(p_type) {
-		case P_CTRL_TYPE:
-			return "ctrl";
-		case P_DATA_TYPE:
-			return "data";
-		case P_CMD_TYPE:
-			return "cmd";
-		default:
-			return "unknown";
+	switch (p_type) {
+	case P_CTRL_TYPE:
+		return "ctrl";
+	case P_DATA_TYPE:
+		return "data";
+	case P_CMD_TYPE:
+		return "cmd";
+	default:
+		return "unknown";
 	}
 }
 
-int hadm_init(struct hadm_struct *hadm, const int hadm_local_id,
+int hadm_init(struct hadm_struct *hadm, const char *hadm_config_path,
 	      const int hadm_cmd_port, int gfp_mask)
 {
 	int ret = 0;
 	int i = 0;
 	char name[MAX_QUEUE_NAME];
-
-	hadm->local_kmod_id = hadm_local_id;
 	hadm->state=1;
 	hadm->major = register_blkdev(0, HADMDEV_NAME);
 	if (hadm->major < 0)
@@ -209,29 +199,43 @@ int hadm_init(struct hadm_struct *hadm, const int hadm_local_id,
 	if (IS_ERR_OR_NULL(hadm->cmd_server_sock)) {
 		return PTR_ERR(hadm->cmd_server_sock);
 	}
-	for(i = 0; i < P_TYPE_NUM; i++) {
-		atomic_set(&hadm->sender_queue_size[i], 0);
-	}
-	init_waitqueue_head(&hadm->queue_event);
 
 	/* TODO: 可以使用一个数组来表示三个线程，并定义对应的参数列表 */
 	hadm_queue_init(hadm->cmd_receiver_queue, "cmd_recv_queue", 1024);
-	hadm_queue_init(hadm->cmd_sender_queue, "cmd_send_queue", 1024);
 	for (i = 0; i < P_TYPE_NUM; i++) {
 		hadm_thread_init(hadm->p_receiver[i], hadm_receiver_threads[i].name,
 			hadm_receiver_threads[i].func, NULL, NULL);
-		hadm_thread_run(hadm->p_receiver[i]);
+		hadm_thread_start(hadm->p_receiver[i]);
 		snprintf(name,MAX_QUEUE_NAME-1,"%s_sender_q", get_ptype_name(i));
 
+		hadm_queue_init(hadm->p_sender_queue[i], name , 2048);
 		hadm_thread_init(hadm->p_sender[i], hadm_sender_threads[i].name,
 			hadm_sender_threads[i].func, NULL, NULL);
-		hadm_thread_run(hadm->p_sender[i]);
+		hadm_thread_start(hadm->p_sender[i]);
 	}
 	hadm_thread_init(hadm->cmd_worker, "cmd_worker",
 			cmd_worker_run, NULL, NULL);
-	hadm_thread_run(hadm->cmd_worker);
+	hadm_thread_start(hadm->cmd_worker);
 
 	hadm_create_proc(hadm);
 
 	return ret;
+}
+
+struct hadm_queue *hadm_get_queue(struct hadm_struct *hadm, int type)
+{
+	struct hadm_queue *q;
+
+	if (type > P_CTRL_START &&
+			type < P_CTRL_END)
+		q = g_hadm->p_sender_queue[P_CTRL_TYPE];
+	else if (type > P_DATA_START &&
+			type < P_DATA_END)
+		q = g_hadm->p_sender_queue[P_DATA_TYPE];
+	else {
+		pr_err("%s: wrong type:%d.", __FUNCTION__, type);
+		q = NULL;
+	}
+
+	return q;
 }

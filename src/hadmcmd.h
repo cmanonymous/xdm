@@ -45,9 +45,9 @@ int do_help(int fd, int argc, char *argv[], struct config *cfg, struct command *
 
 void do_help_usage();
 
-int common_sync_check(int argc, char *argv[], struct config *cfg, struct res_config **res, struct node_state_packet **node_state);
+int common_sync_check(int argc, char *argv[], struct config *cfg, struct res_config **res, struct site_state_packet **site_state);
 
-int common_sync(int fd, struct command *subcmd, struct res_config *res, struct node_state_packet *node);
+int common_sync(int fd, struct command *subcmd, struct res_config *res, struct site_state_packet *node);
 
 int do_fullsync(int fd, int argc, char *argv[], struct config *cfg, struct command *subcmd);
 
@@ -79,12 +79,8 @@ int do_dump(int fd, int argc, char *argv[], struct config *cfg, struct command *
 
 void do_dump_usage();
 
-int do_dumpbwr(int fd, int argc, char *argv[], struct config *cfg, struct command *subcmd);
-
-void do_dumpbwr_usage();
-
-int do_startkmod(int fd, int argc, char *argv[], struct config *cfg, struct command *subcmd);
-
-void do_startkmod_usage(void);
-
+int do_master(int fd, int argc, char *argv[], struct config *cfg, struct command *subcmd);
+void do_master_usage();
+int do_slaver(int fd, int argc, char *argv[], struct config *cfg, struct command *subcmd);
+void do_slaver_usage();
 #endif // __HADMCMD_H__

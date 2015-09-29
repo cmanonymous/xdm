@@ -5,6 +5,12 @@ int check_all_connected(struct node_list *node_list);
 
 void clean_connection(struct node_list *node_list);
 
+int node_connect_function(void *data);
+
+int site_connect_function(void *data);
+
+int node_list_do_connect(struct node_list *node_list);
+
 int node_list_connect(struct node_list *node_list);
 
 int connect_function(void *data);

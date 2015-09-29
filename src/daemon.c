@@ -1,5 +1,7 @@
 #include "common.h"
 
+#define KMOD_CHECK_TIMEOUT 1
+
 struct daemon *alloc_daemon()
 {
 	struct daemon *daemon;
@@ -18,35 +20,45 @@ struct daemon *alloc_daemon()
 struct daemon *create_daemon(struct config *cfg)
 {
 	struct daemon *daemon;
-	struct node_list *node_list;
-	struct device_list *dev_list;
+	struct node_list *lnode_list;
+	struct resource_list *resource_list;
+	struct device *dev;
 
 	daemon = alloc_daemon();
 	if(daemon == NULL) {
 		return NULL;
 	}
+	daemon->local_site_id = cfg->local_site_id;
+	daemon->rnode_list = NULL;
+	pthread_spin_init(&daemon->rnode_list_lock, PTHREAD_PROCESS_PRIVATE);
 
-	node_list = init_node_list(daemon, cfg);
-	if(node_list == NULL) {
-		goto err_node_list;
+	resource_list = init_resource_list(daemon, cfg);
+	if (resource_list == NULL)
+		goto err_free_daemon;
+	daemon->resource_list = resource_list;
+
+	lnode_list = init_lnode_list(daemon, cfg);
+	if(lnode_list == NULL) {
+		goto err_lnode_list;
 	}
-	daemon->node_list = node_list;
+	daemon->lnode_list = lnode_list;
 
-	dev_list = init_device_list(daemon, cfg);
-	if (!dev_list) {
-		log_error("ERROR: no memory init device list");
-		goto err_dev_list;
+	dev = init_device(daemon, cfg);
+	if(dev == NULL) {
+		goto err_dev;
 	}
-	daemon->dev_list = dev_list;
+	daemon->dev = dev;
 
-	daemon->local_node = node_list->nodes[node_list->local_node_id];
+	daemon->local_node = lnode_list->nodes[lnode_list->local_node_id];
 	daemon->local_handler = local_handler;
 
 	return daemon;
 
-err_dev_list:
-	free_node_list(node_list);
-err_node_list:
+err_dev:
+	free_node_list(lnode_list);
+err_lnode_list:
+	free_resource_list(resource_list);
+err_free_daemon:
 	free(daemon);
 	return NULL;
 }
@@ -59,6 +71,7 @@ int init_daemon(struct daemon *daemon)
 	struct event *local_event;
 	struct thread *thread;
 	struct timer_base *timer_base;
+	char name[MAX_NAME_LEN];
 
 	local_node = daemon->local_node;
 	fd = make_server(local_node->local_ip, local_node->local_port);
@@ -88,11 +101,17 @@ int init_daemon(struct daemon *daemon)
 
 	daemon->local_event = local_event;
 
-	thread = create_thread(connect_function, daemon);
+	thread = create_thread("daemon:local_connect", "node_connect_function", node_connect_function, daemon);
 	if(thread == NULL) {
 		goto err;
 	}
-	daemon->connect_thread = thread;
+	daemon->local_connect_thread = thread;
+
+	thread = create_thread("daemon:remote_connect", "site_connect_function", site_connect_function, daemon);
+	if(thread == NULL) {
+		goto err;
+	}
+	daemon->remote_connect_thread = thread;
 
 	timer_base = init_timer_base(daemon);
 	daemon->timer_base = timer_base;
@@ -110,11 +129,11 @@ err:
 
 int daemon_run(struct daemon *daemon)
 {
-	thread_run(daemon->connect_thread);
+	thread_run(daemon->local_connect_thread);
 	timer_base_run(daemon->timer_base);
 
-	device_list_run(daemon->dev_list);
-	node_list_run(daemon->node_list);
+	device_run(daemon->dev);
+	node_list_run(daemon->lnode_list);
 
 	return event_base_dispatch(daemon->event_base);
 }
@@ -126,11 +145,10 @@ void local_handler(evutil_socket_t fd, short event, void *args)
 	struct event *ev;
 	struct packet *pkt;
 	struct packet *pkt_ack;
-	struct device_list *dev_list;
 	struct device *dev;
 
 	daemon = (struct daemon *)args;
-	dev_list = daemon->dev_list;
+	dev = daemon->dev;
 
 	cfd = sock_accept(daemon->local_fd, NULL, NULL);
 	if(cfd < 0) {
@@ -141,11 +159,6 @@ void local_handler(evutil_socket_t fd, short event, void *args)
 	if(pkt == NULL) {
 		sock_close(cfd);
 		return;
-	}
-	dev = find_device(dev_list, pkt->kmod_from);
-	if (!dev) {
-		log_error("ERROR: Can not find kmod on node %d", pkt->kmod_from);
-		goto err;
 	}
 
 	if(pkt->type == P_KERN_HANDSHAKE_D) {
@@ -161,28 +174,27 @@ void local_handler(evutil_socket_t fd, short event, void *args)
 			packet_send(dev->dfd, pkt_ack);
 			log_info("data link handshake from kernel");
 
-			ev = event_new(daemon->event_base, dev->dfd, EV_READ, dev->data_handler, dev);
+			ev = event_new(daemon->event_base, dev->dfd, EV_READ | EV_PERSIST, dev->data_handler, dev);
 			if(ev == NULL) {
 				free_packet(pkt_ack);
 				dev->dfd = -1;
 				goto err;
 			}
 
-			dev->data_event = ev;
 			if(event_add(ev, NULL) < 0) {
 				event_free(ev);
 				free_packet(pkt_ack);
 				dev->dfd = -1;
-				dev->data_event = NULL;
 				goto err;
 			}
 
+			dev->data_event = ev;
 			free_packet(pkt_ack);
 		} else {
 			sock_close(cfd);
-			//dev_del_data_event(dev);
 		}
 	} else if(pkt->type == P_KERN_HANDSHAKE_M) {
+
 		if(dev->mfd < 0 && dev->meta_event == NULL) {
 			pkt_ack = alloc_packet0();
 			if(pkt_ack == NULL) {
@@ -196,26 +208,24 @@ void local_handler(evutil_socket_t fd, short event, void *args)
 			packet_send(dev->mfd, pkt_ack);
 			log_info("data link handshake from kernel");
 
-			ev = event_new(daemon->event_base, dev->mfd, EV_READ, dev->meta_handler, dev);
+			ev = event_new(daemon->event_base, dev->mfd, EV_READ | EV_PERSIST, dev->meta_handler, dev);
 			if(ev == NULL) {
 				free_packet(pkt_ack);
 				dev->mfd = -1;
 				goto err;
 			}
 
-			dev->meta_event = ev;
 			if(event_add(ev, NULL) < 0) {
 				event_free(ev);
 				free_packet(pkt_ack);
 				dev->mfd = -1;
-				dev->meta_event = NULL;
 				goto err;
 			}
 
+			dev->meta_event = ev;
 			free_packet(pkt_ack);
 		} else {
 			sock_close(cfd);
-			//dev_del_meta_event(dev);
 		}
 	} else {
 		sock_close(cfd);
@@ -229,131 +239,39 @@ err:
 	sock_close(cfd);
 }
 
-void dev_data_force_handle_cb(void *data)
-{
-	struct device *dev = data;
-
-	if (!dev->data_event)
-		return;
-	log_debug("%s: force resume for dev %d", __func__, dev->id);
-	if (event_add(dev->data_event, NULL) < 0) {
-		log_error("failed to add data event on kmod %d", dev->id);
-		dev_del_data_event(dev);
-	}
-}
-
-/* 从 kmod 节点收到的数据，需要把它挂入到对应的 servr 节点中 */
 void kern_data_handler(evutil_socket_t fd, short event, void *args)
 {
-	struct daemon *daemon;
 	struct device *dev;
-	struct node_list *node_list;
-	struct node *node;
-	struct packet *pkt, *pkt_clone;
-	int i, ret, full;
-	cb_fn *cb;
+	struct packet *pkt;
 
 	dev = (struct device *)args;
-	daemon = dev->daemon;
-	node_list = daemon->node_list;
 
 	pkt = packet_recv(dev->dfd);
-	if (!pkt) {
-		log_error("failed to receive data from kmod %d on fd %d", dev->id, dev->dfd);
+	if(pkt == NULL) {
 		dev_del_data_event(dev);
-		return;
-	}
+	} else {
+		log_debug("<<<<< recv data packet from kernel");
+		log_packet_header(pkt);
 
-	full = 0;
-	for (i = 0; i < node_list->node_num; i++) {
-		node = node_list->nodes[i];
-		if (!node_is_target(node, pkt->node_to))
-			continue;
-		/* 我们希望kmod之间的连接是可靠连接，一个基本的要求就是连接正常时不能丢包。
-		 * 而kmod之间的连接经过了两个proxy server,这就要求这些中间节点维持这些可靠性。
-		 * 现在，由于节点的连接与发给kmod的conn_state包之间存在时延，在节点断开后快速
-		 * 建立连接的情况下，kmod对此是无感知的, 也就有可能出现丢包的情况。
-		 * 因此为简化处理，当中间出现断连时，就给kmod发送断连包, 丢弃已存在的包
-		 */
-		if (!node_available(node))
-			continue;
-		pkt_clone = packet_clone(pkt);
-		if (!pkt_clone) {
-			log_error("Do NOT send data packet to server %d: no memory", node->id);
-			goto out;
-		}
-		cb = full ? NULL : dev_data_force_handle_cb;
-		ret = node_put_data_packet_force(node, pkt_clone, cb, dev);
-		if (ret < 0) {
-			log_error("node %d data queue is NOT start", node->id);
-			dev_del_data_event(dev);
-			free_packet(pkt);
-			return;
-		} else if (ret > 0) {
-			log_info("%s: force handle for dev %d", __func__, dev->id);
-			full = 1;
-		}
-
-	}
-
-out:
-	free_packet(pkt);
-	if (!full) {
-		ret = event_add(dev->data_event, NULL);
-		if (ret < 0) {
-			log_error("failed to add data event on kmod %d", dev->id);
-			dev_del_data_event(dev);
-		}
+		dev_put_work_packet(dev, pkt);
 	}
 }
 
 void kern_meta_handler(evutil_socket_t fd, short event, void *args)
 {
-	struct daemon *daemon;
 	struct device *dev;
-	struct node_list *node_list;
-	struct node *node;
-	struct packet *pkt, *pkt_clone;
-	int i, ret;
+	struct packet *pkt;
 
 	dev = (struct device *)args;
-	daemon = dev->daemon;
-	node_list = daemon->node_list;
 
 	pkt = packet_recv(dev->mfd);
-	if (!pkt) {
-		log_error("failed to receive meta from kmod %d on fd %d", dev->id, dev->mfd);
+	if(pkt == NULL) {
 		dev_del_meta_event(dev);
-		return;
-	}
+	} else {
+		log_debug("<<<<< recv meta packet from kernel");
+		log_packet_header(pkt);
 
-	for (i = 0; i < node_list->node_num; i++) {
-		node = node_list->nodes[i];
-		if (!node_is_target(node, pkt->node_to))
-			continue;
-		if (!node_available(node))
-			continue;
-		pkt_clone = packet_clone(pkt);
-		if (!pkt_clone) {
-			log_warn("Do NOT send meta packet to server %d: no memory", node->id);
-			goto out;
-		}
-		ret = node_put_meta_packet(node, pkt_clone);
-		if (ret < 0) {
-			log_error("node %d data queue is NOT start", node->id);
-			dev_del_meta_event(dev);
-			free_packet(pkt);
-			return;
-		}
-	}
-
-out:
-	free_packet(pkt);
-add_pending_event:
-	ret = event_add(dev->meta_event, NULL);
-	if (ret < 0) {
-		log_error("failed to add meta event on kmod %d", dev->id);
-		dev_del_meta_event(dev);
+		dev_put_work_packet(dev, pkt);
 	}
 }
 
@@ -379,38 +297,41 @@ struct timer_base *init_timer_base(struct daemon *daemon)
 	}
 	tb->event_base = event_base;
 
-	thread = create_thread(timer_function, tb);
+	thread = create_thread("daemon:timer_thread", "timer_function", timer_function, tb);
 	if(thread == NULL) {
 		goto err_thread;
 	}
 	tb->timer_thread = thread;
 
-	timer = create_timer(CONNECT_TIMER_TIMEOUT, connect_timer_cb, tb);
+	timer = create_timer("connect_timer", CONNECT_TIMER_TIMEOUT, connect_timer_cb, tb);
 	if(timer == NULL) {
 		goto err_conn_timer;
 	}
 	tb->connect_timer = timer;
 
+	timer = create_timer("kmod_check_timer", KMOD_CHECK_TIMEOUT, kmod_check_timer_cb, tb);
+	if(timer == NULL) {
+		goto err_kmod_timer;
+	}
+	tb->kmod_check_timer = timer;
+
 	return tb;
 
 err_kmod_timer:
 	free_timer(tb->connect_timer);
-
 err_conn_timer:
 	free_thread(thread);
-
 err_thread:
 	event_base_free(event_base);
-
 err_event_base:
 	free(tb);
-
 	return NULL;
 }
 
 void timer_base_run(struct timer_base *tb)
 {
 	timer_add_tb(tb, tb->connect_timer);
+	timer_add_tb(tb, tb->kmod_check_timer);
 	thread_run(tb->timer_thread);
 }
 
@@ -423,4 +344,18 @@ int timer_function(void *data)
 	tb = thr->data;
 
 	return event_base_dispatch(tb->event_base);
+}
+
+void kmod_check_timer_cb(evutil_socket_t fd, short event, void *args)
+{
+	struct timer_base *tb;
+
+	tb = (struct timer_base *)args;
+
+	if(!check_module()) {
+		log_error("hadm_kmod removed, hadm_server quit!");
+		exit(EXIT_FAILURE);
+	}
+
+	timer_add_tb(tb, tb->kmod_check_timer);
 }

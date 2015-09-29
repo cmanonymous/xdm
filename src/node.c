@@ -25,78 +25,36 @@ struct node *alloc_node()
 
 void free_node(struct node *node)
 {
+	if (node) {
+		free_thread(node->worker);
+		free_thread(node->meta_worker);
+		free_thread(node->data_worker);
+		free_queue(node->work_q);
+		free_queue(node->data_q);
+		free_queue(node->meta_q);
+	}
 	free(node);
 }
 
-/* target: 1, otherwise: 0 */
-int node_is_target(struct node *node, int node_to)
-{
-	//return !!(node->share_node_bits & node_to);
-	return !!((1 << node->id) & node_to);
-}
-
-int node_available(struct node *node)
-{
-	return node->dfd > 0 && node->mfd > 0;
-}
-
-int node_disconnect(struct node *node)
-{
-	int i, ret;
-	struct device *dev;
-	struct packet *pkt, *notify;
-	struct daemon *daemon = node->daemon;
-
-	log_error("%s: disconnect node %d\n", __func__, node->id);
-	pkt = alloc_packet0();
-	if (!pkt) {
-		log_error("Error: %s alloc packet failed", __func__);
-		return -ENOMEM;
-	}
-	pkt->type = P_KMOD_DISCONN;
-	pkt->dev_id = MAX_DEVICES;
-	pkt->node_from = node->id;
-	pkt->kmod_from = INVALID_ID;	//FIXME 是否导入了不一致?
-	pkt->node_to = daemon->local_node->id;
-
-	for (i = 0; i < daemon->dev_list->dev_num; i++) {
-		dev = daemon->dev_list->devs[i];
-		if (!device_want_recv(dev))
-			continue;
-		notify = packet_clone(pkt);
-		if (!notify) {
-			log_error("alloc disconnect notify packet failed.");
-			ret = -ENOMEM;
-			goto out;
-		}
-		notify->kmod_to = (1 << dev->id);
-		ret = dev_put_meta_packet(dev, notify);
-		if (ret < 0) {
-			log_error("Error: put meta packet failed.");
-			goto out;
-		}
-
-	}
-out:
-	free_packet(pkt);
-	return ret;
-
-}
-
-struct node *make_node(int id, const char *hostname,
+int init_node(struct node *node, int type, int id, const char *hostname,
 		const char *local_ip, const char *remote_ip,
-		const char *local_port, const char *remote_port)
+		const char *local_port, const char *remote_port,
+		int ping_timer_timeout, int max_ping_count)
 {
-	struct node *node;
 	struct queue *q;
 	struct thread *thr;
+	char name[MAX_NAME_LEN];
 
-	node = alloc_node();
-	if(node == NULL) {
-		return NULL;
-	}
+	memset(node, 0, sizeof(struct node));
+	node->dfd = -1;
+	node->data_conn_state = NODE_DFD_DISCONNECTED;
+	node->mfd = -1;
+	node->meta_conn_state = NODE_MFD_DISCONNECTED;
+	pthread_spin_init(&node->spinlock, PTHREAD_PROCESS_PRIVATE);
 
 	node->id = id;
+	node->type = type;
+	node->sfd = -1;
 	strncpy(node->hostname, hostname, MAX_HOSTNAME_LEN);
 	strncpy(node->local_ip, local_ip, MAX_IPADDR_LEN);
 	strncpy(node->remote_ip, remote_ip, MAX_IPADDR_LEN);
@@ -104,163 +62,141 @@ struct node *make_node(int id, const char *hostname,
 	strncpy(node->remote_port, remote_port, MAX_PORT_LEN);
 	node->data_handler = node_data_handler;
 	node->meta_handler = node_meta_handler;
+	node->ping_timer_timeout = ping_timer_timeout;
+	node->max_ping_count = max_ping_count;
 
 	q = init_queue();
-	if(q == NULL) {
-		free_node(node);
-		return NULL;
-	}
+	if (!q)
+		return -1;
 	node->data_q = q;
 
 	q = init_queue();
-	if(q == NULL) {
-		free_queue(node->data_q);
-		free_node(node);
-		return NULL;
-	}
+	if (!q)
+		goto err_free_data_q;
 	node->meta_q = q;
 
 	q = init_queue();
-	if(q == NULL) {
-		free_queue(node->data_q);
-		free_queue(node->meta_q);
-		free_node(node);
-		return NULL;
-	}
+	if (!q)
+		goto err_free_meta_q;
 	node->work_q = q;
 
-	thr = create_thread(node_data_worker_function, node);
-	if(thr == NULL) {
-		goto err_data;
-	}
+	snprintf(name, sizeof(name), "%s%d:data_worker", node_type_name[node->type], node->id);
+	thr = create_thread(name, "node_data_worker_function", node_data_worker_function, node);
+	if (!thr)
+		goto err_free_work_q;
 	node->data_worker = thr;
 
-	thr = create_thread(node_meta_worker_function, node);
-	if(thr == NULL) {
-		goto err_meta;
-	}
+	snprintf(name, sizeof(name), "%s%d:meta_worker", node_type_name[node->type], node->id);
+	thr = create_thread(name, "node_meta_worker_function", node_meta_worker_function, node);
+	if (!thr)
+		goto err_free_data_thread;
 	node->meta_worker = thr;
+
+	snprintf(name, sizeof(name), "%s%d:worker", node_type_name[node->type], node->id);
+	thr = create_thread(name, "node_worker_function", node_worker_function, node);
+	if (!thr)
+		goto err_free_meta_thread;
+	node->worker = thr;
+
+	return 0;
+
+err_free_meta_thread:
+	free_thread(node->meta_worker);
+err_free_data_thread:
+	free_thread(node->data_worker);
+err_free_work_q:
+	free_queue(node->work_q);
+err_free_data_q:
+	free_queue(node->data_q);
+err_free_meta_q:
+	free_queue(node->meta_q);
+	return -1;
+}
+
+struct node *make_node(int type, int id, const char *hostname,
+		const char *local_ip, const char *remote_ip,
+		const char *local_port, const char *remote_port,
+		int ping_timer_timeout, int max_ping_count)
+{
+	struct node *node;
+	int ret;
+
+	node = alloc_node();
+	if(node == NULL) {
+		return NULL;
+	}
+	ret = init_node(node, type, id, hostname,
+			local_ip, remote_ip, local_port, remote_port,
+			ping_timer_timeout, max_ping_count);
+	if (ret < 0)
+		goto err_free_node;
 
 	return node;
 
-err_worker:
-	free_thread(node->meta_worker);
-
-err_meta:
-	free_thread(node->data_worker);
-
-err_data:
-	free_queue(node->data_q);
-	free_queue(node->meta_q);
+err_free_node:
 	free_node(node);
-
 	return NULL;
 }
 
-int node_connect(int link, struct node *local_node, struct node *remote_node)
+int node_handshake(int link, struct node *local_node, struct node *remote_node)
 {
 	int fd;
-	int ret;
-	struct sockaddr local_addr;
-	struct sockaddr remote_addr;
 	struct sock_packet *sock_pkt;
 
-	fd_set rset;
-	fd_set wset;
-	struct timeval tv;
-	int error;
-	int len;
-
-	if(link == NODE_DATA_LINK
-			&& remote_node->data_conn_state == NODE_DFD_CONNECTED) {
-		return 0;
-	}
-
-	if(link == NODE_META_LINK
-			&& remote_node->meta_conn_state == NODE_MFD_CONNECTED) {
-		return 0;
-	}
-
-	fd = sock_create();
-	if(fd < 0) {
+	if(link == NODE_DATA_LINK) {
+		sock_pkt = create_sock_packet(DATA_HANDSHAKE, local_node->id, remote_node->type, remote_node->local_ip);
+		fd = remote_node->dfd;
+	} else if(link == NODE_META_LINK) {
+		sock_pkt = create_sock_packet(META_HANDSHAKE, local_node->id, remote_node->type, remote_node->local_ip);
+		fd = remote_node->mfd;
+	} else {
 		return -1;
 	}
 
-	if(sock_get_addr(local_node->remote_ip, NULL, &local_addr) < 0) {
-		goto err;
-	}
-
-	if(sock_get_addr(remote_node->remote_ip, remote_node->remote_port, &remote_addr) < 0) {
-		goto err;
-	}
-
-	if(sock_bind(fd, &local_addr) < 0) {
-		goto err;
-	}
-
-	sock_set_nonblock(fd);
-	ret = sock_connect(fd, &remote_addr);
-
-	if(ret < 0 && errno != EINPROGRESS) {
-		goto err;
-	} else if(ret == 0) {
-		goto done;
-	} else {
-		FD_ZERO(&rset);
-		FD_SET(fd, &rset);
-		wset = rset;
-
-		tv.tv_sec = SOCK_TIMEOUT;
-		tv.tv_usec = 0;
-
-		ret = select(SELECT_MAX_FDS, &rset, &wset, NULL, &tv);
-		if(ret <= 0) {
-			goto err;
-		}
-
-		error = 0;
-		len = sizeof(int);
-		if(FD_ISSET(fd, &rset) || FD_ISSET(fd, &wset)) {
-			if(getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &len) < 0) {
-				goto err;
-			}
-		}
-
-		if(error) {
-			goto err;
-		}
-
-		goto done;
-	}
-
-done:
-	if(link == NODE_DATA_LINK) {
-		sock_pkt = create_sock_packet(local_node->id, DATA_HANDSHAKE);
-	} else if(link == NODE_META_LINK) {
-		sock_pkt = create_sock_packet(local_node->id, META_HANDSHAKE);
-	} else {
-		goto err;
-	}
-
 	if(sock_pkt == NULL) {
-		goto err;
+		return -1;
 	}
 
 	sock_clear_nonblock(fd);
 	sock_packet_send(fd, sock_pkt);
 	free_sock_packet(sock_pkt);
 
-	if(link == NODE_DATA_LINK) {
-		remote_node->dfd = fd;
-	} else if(link == NODE_META_LINK) {
-		remote_node->mfd = fd;
+	return 0;
+}
+
+int node_connect(int link, struct node *local_node, struct node *remote_node)
+{
+	int *fdp;
+	int sock;
+	struct sockaddr remote_addr;
+	struct sock_packet *sock_pkt;
+
+	fdp = link == NODE_DATA_LINK ? &remote_node->dfd : &remote_node->mfd;
+
+	if (*fdp < 0) {
+		sock = sock_create();
+		if (sock < 0)
+			return -1;
+		if (sock_set_nonblock(sock) < 0)
+			return -1;
+		*fdp = sock;
 	}
 
-	return 0;
+	if (sock_get_addr(remote_node->remote_ip, remote_node->remote_port, &remote_addr) < 0) {
+		return -1;
+	}
 
-err:
-	sock_close(fd);
-	return -1;
+	return sock_connect(*fdp, &remote_addr);
+}
+
+int node_data_handshake(struct node *local_node, struct node *remote_node)
+{
+	return node_handshake(NODE_DATA_LINK, local_node, remote_node);
+}
+
+int node_meta_handshake(struct node *local_node, struct node *remote_node)
+{
+	return node_handshake(NODE_META_LINK, local_node, remote_node);
 }
 
 int node_data_connect(struct node *local_node, struct node *remote_node)
@@ -275,37 +211,33 @@ int node_meta_connect(struct node *local_node, struct node *remote_node)
 
 int node_make_server(struct node *node)
 {
-	return make_server(node->remote_ip, node->remote_port);
+	char ipaddr[MAX_IPADDR_LEN];
+
+	snprintf(ipaddr, sizeof(ipaddr), "%s", node->type == SITE_NODE ? "0.0.0.0" : node->remote_ip);
+
+	return make_server(ipaddr, node->remote_port);
 }
 
 int node_add_data_event(struct node *node, struct daemon *daemon)
 {
 	struct event *data_event;
 
-	log_error("%s: add data event for node %d", __func__, node->id);
 	if(node->data_conn_state == NODE_DFD_DISCONNECTED
 			|| node->data_event != NULL) {
-		log_error("Error: %s node %d add data event failed(conn:%d|event:%p)",
-				__func__, node->id, node->data_conn_state, node->data_event);
 		return -1;
 	}
 
-	data_event = event_new(daemon->event_base, node->dfd, EV_READ, node->data_handler, node);
+	data_event = event_new(daemon->event_base, node->dfd, EV_READ | EV_PERSIST, node->data_handler, node);
 	if(data_event == NULL) {
-		log_error("Error: %s alloc event failed", __func__);
+		return -1;
+	}
+
+	if(event_add(data_event, NULL)) {
+		event_free(data_event);
 		return -1;
 	}
 
 	node->data_event = data_event;
-
-	if(event_add(data_event, NULL)) {
-		log_error("Error: %s add event failed", __func__);
-		event_free(data_event);
-		node->data_event = NULL;
-		return -1;
-	}
-
-	// sock_set_nonblock(node->dfd);
 
 	return 0;
 }
@@ -314,22 +246,20 @@ void node_del_data_event(struct node *node)
 {
 	int ret;
 
-	log_error("%s: del data event for node %d", __func__, node->id);
-	ret = pthread_spin_trylock(&node->spinlock);
-	if(ret != 0) {
-		log_error("%s: del data event get lock failed", __func__);
-		return;
-	}
-
-	if(node->data_event == NULL) {
-		log_error("%s: null data_event for node %d, cancel", __func__, node->id);
-		goto err;
-	}
-
 	shutdown(node->dfd, SHUT_RDWR);
 	sock_close(node->dfd);
 	node->dfd = -1;
 	node->data_conn_state = NODE_DFD_DISCONNECTED;
+	node->ping_count = 0;
+
+	ret = pthread_spin_trylock(&node->spinlock);
+	if(ret != 0) {
+		return;
+	}
+
+	if(node->data_event == NULL) {
+		goto err;
+	}
 
 	event_free(node->data_event);
 	node->data_event = NULL;
@@ -337,8 +267,6 @@ void node_del_data_event(struct node *node)
 	pthread_spin_unlock(&node->spinlock);
 
 	clean_packet_queue(node->data_q);
-
-	node_disconnect(node);
 
 	return;
 
@@ -350,30 +278,22 @@ int node_add_meta_event(struct node *node, struct daemon *daemon)
 {
 	struct event *meta_event;
 
-	log_error("%s: node %d", __func__, node->id);
 	if(node->meta_conn_state == NODE_MFD_DISCONNECTED
 			|| node->meta_event != NULL) {
-		log_error("Error: %s (conn:%d|meta_event:%p)", __func__,
-				node->meta_conn_state, node->meta_event);
 		return -1;
 	}
 
-	meta_event = event_new(daemon->event_base, node->mfd, EV_READ, node->meta_handler, node);
+	meta_event = event_new(daemon->event_base, node->mfd, EV_READ | EV_PERSIST, node->meta_handler, node);
 	if(meta_event == NULL) {
-		log_error("Error: %s alloc event failed", __func__);
+		return -1;
+	}
+
+	if(event_add(meta_event, NULL)) {
+		event_free(meta_event);
 		return -1;
 	}
 
 	node->meta_event = meta_event;
-
-	if(event_add(meta_event, NULL)) {
-		log_error("Error: %s add event failed", __func__);
-		event_free(meta_event);
-		node->meta_event = NULL;
-		return -1;
-	}
-
-	// sock_set_nonblock(node->mfd);
 
 	return 0;
 }
@@ -382,23 +302,20 @@ void node_del_meta_event(struct node *node)
 {
 	int ret;
 
-	log_error("%s: node %d", __func__, node->id);
-	ret = pthread_spin_trylock(&node->spinlock);
-	if(ret != 0) {
-		log_error("Error: %s try lock failed", __func__);
-		return;
-	}
-
-	if(node->meta_event == NULL) {
-		log_error("Error: %s null meta event", __func__);
-		goto err;
-	}
-
 	shutdown(node->mfd, SHUT_RDWR);
 	sock_close(node->mfd);
 	node->mfd = -1;
 	node->meta_conn_state = NODE_MFD_DISCONNECTED;
-	node->ping = 0;
+	node->ping_count = 0;
+
+	ret = pthread_spin_trylock(&node->spinlock);
+	if(ret != 0) {
+		return;
+	}
+
+	if(node->meta_event == NULL) {
+		goto err;
+	}
 
 	event_free(node->meta_event);
 	node->meta_event = NULL;
@@ -406,8 +323,6 @@ void node_del_meta_event(struct node *node)
 	pthread_spin_unlock(&node->spinlock);
 
 	clean_packet_queue(node->meta_q);
-
-	node_disconnect(node);
 
 	return;
 
@@ -420,16 +335,25 @@ int node_add_ping_timer(struct node *node, struct daemon *daemon)
 	struct timer *ping_timer;
 	struct node_list *node_list;
 	struct timer_base *tb;
+	char name[MAX_NAME_LEN];
 
 	tb = daemon->timer_base;
-	node_list = daemon->node_list;
+
+	if (node->type == LOCAL_NODE) {
+		node_list = daemon->lnode_list;
+	} else /* node->type == SITE_NODE */ {
+		pthread_spin_lock(&daemon->rnode_list_lock);
+		node_list = daemon->rnode_list;
+		pthread_spin_unlock(&daemon->rnode_list_lock);
+	}
 
 	if(node->ping_timer != NULL) {
 		timer_add_tb(tb, node->ping_timer);
 		return 0;
 	}
 
-	ping_timer = create_timer(node_list->ping, ping_timer_cb, node);
+	snprintf(name, sizeof(name), "%s%d:ping_timer", node_type_name[node->type], node->id);
+	ping_timer = create_timer(name, node->ping_timer_timeout, ping_timer_cb, node);
 	if(ping_timer == NULL) {
 		return -1;
 	}
@@ -472,6 +396,14 @@ struct node_list *create_node_list(int node_num)
 	return alloc_node_list(node_num);
 }
 
+void node_list_clean_up(struct node_list *list)
+{
+	if (list) {
+		free(list->nodes);
+		free(list);
+	}
+}
+
 void free_node_list(struct node_list *node_list)
 {
 	int idx;
@@ -486,83 +418,115 @@ void free_node_list(struct node_list *node_list)
 	free(node_list);
 }
 
-void node_list_set_local(struct node_list *node_list)
+/*
+ * node_logowner: 判断节点是不是 resource 的 logowner
+ *
+ * 什么是 logowner 节点？
+ *
+ * 一个设备（resource）可以运行在多个 site 中，这些可运行的 site 叫做 runsite，
+ * 在每个 runsite 里面，resource 可以运行在多个节点中，这些节点是 runsite 所有节
+ * 点的一个子集。这些节点中只有一个具有写入设备（resource）的权限，这个节点就叫
+ * 做 logowner。
+ *
+ * logowner 节点具有浮动 IP，也就是说，它除了具有本地节点的 IP 之外，还有一个标
+ * 识 logowner 节点的 IP。比如，resource 在一个 site 运行的浮动 IP 是
+ * 192.168.2.100，这个 site 里面有两个节点：
+ *
+ *     node0: 192.168.1.2
+ *     node1: 192.168.1.3
+ *
+ * 那么，如果 node0 是 logowner 节点，那么 site 里面这两个节点的 IP 分别是：
+ *
+ *     node0: 192.168.1.2, 192.168.2.100
+ *     node1: 192.168.1.3
+ *
+ * 如果 node1 是 logowner 节点，那么 site 里面这两个节点的 IP 分别是：
+ *
+ *     node0: 192.168.1.2
+ *     node1: 192.168.1.3, 192.168.2.10
+ *
+ * 判断的依据是，节点的所有 IP 是否有一个是 resource 运行在本地 site 的 IP。
+ *
+ * return:
+ *     0 - not log owner
+ *     1 - yes, it is log owner
+ */
+int node_logowner(struct resource *resource)
 {
-	struct ip_list *ip_list;
+	struct ip_list *list;
 	int i, j;
+	int ret = 0;
 
-	ip_list = create_ip_list(3);
-	if (!ip_list) {
-		log_error("failed to create IP list");
-		return;
-	}
+	list = create_ip_list(16);
+	if (!list)
+		return 0;
 
-	init_ip_list(ip_list);
+	init_ip_list(list);
+	for (i = 0; i < list->inuse; i++) {
+		struct ip *ip;
 
-	for (i = 0; i < node_list->node_num; i++) {
-		struct node *node;
-
-		node = node_list->nodes[i];
-		for (j = 0; j < ip_list->inuse; j++) {
-			struct ip *ip;
-
-			ip = &ip_list->ips[j];
-			if (!strcmp(node->local_ip, ip->addr)) {
-				node_list->local_node_id = i;
-				break;
-			}
+		ip = &list->ips[i];
+		if (!strncmp(ip->addr, resource->local_site->remote_ip, strlen(ip->addr))) {
+			ret = 1;
+			break;
 		}
 	}
 
-	free_ip_list(ip_list);
+	free_ip_list(list);
+	return ret;
 }
 
-static void node_set_share_node_bits(struct node *node, struct config *cfg)
+/*
+ * logowner_in: 判断节点是不是 resource 列表中某一个 resource 的 logowner
+ *
+ * return:
+ *     0 - not log owner
+ *     1 - at least one resource logowner
+ */
+int logowner_in(struct resource_list *list)
 {
-	struct node_config *node_cfg;
 	int i;
+	int ret = 0;
 
-	for (i = 0; i < cfg->node_num; i++) {
-		node_cfg = &cfg->nodes[i];
-		if (node_cfg->server_id == node->id)
-			node->share_node_bits |= 1 << node_cfg->id;
+	for (i = 0; i < list->nr; i++) {
+		struct resource *resource;
+
+		resource = list->resources[i];
+		ret |= node_logowner(resource);
+		if (ret)
+			break;
 	}
+
+	return ret;
 }
 
-struct node_list *init_node_list(struct daemon *daemon, struct config *cfg)
+struct node_list *init_lnode_list(struct daemon *daemon, struct config *cfg)
 {
-	struct node_list *node_list;
-	struct server_config *server_cfg;
-	struct node *node;
 	int idx;
+	struct node_list *node_list;
+	struct node *node;
+	struct site_config *site_cfg;
+	struct node_config *node_cfg;
 
-	node_list = create_node_list(cfg->server_num);
-	if (!node_list) {
-		log_error("failed to create %d server nodes", cfg->server_num);
+	site_cfg = &cfg->sites[cfg->local_site_id];
+	node_list = create_node_list(site_cfg->node_num);
+	if(node_list == NULL) {
 		return NULL;
 	}
 
-	node_list->ping = cfg->ping;
-	node_list->pingtimeout = cfg->pingtimeout;
-
-	for (idx = 0; idx < cfg->server_num; idx++) {
-		server_cfg = &cfg->servers[idx];
-		node = make_node(server_cfg->id, "server",
-				 server_cfg->localipaddr, server_cfg->remoteipaddr,
-				 server_cfg->localport, server_cfg->remoteport);
-		if (!node) {
-			log_error("failed to create node %d", server_cfg->id);
+	for (idx = 0; idx < site_cfg->node_num; idx++) {
+		node_cfg = &site_cfg->nodes[idx];
+		node = make_node(LOCAL_NODE, node_cfg->id, node_cfg->hostname,
+				 cfg->serverip, node_cfg->ipaddr, cfg->serverport, node_cfg->port,
+				 cfg->pingtimeout, cfg->maxpingcount);
+		if(node == NULL) {
 			goto err;
 		}
 
 		node_set_daemon(node, daemon);
-		node_set_share_node_bits(node, cfg);
 		node_list_put(node_list, node);
-	}
-	node_list_set_local(node_list);
-	if (node_list->local_node_id < 0) {
-		log_error("can not find local node ip");
-		goto err;
+		if (node->id == cfg->local_node_id)
+			node_list->local_node_id = idx;
 	}
 
 	return node_list;
@@ -601,156 +565,88 @@ int node_list_put(struct node_list *list, struct node *node)
 	return (list->node_num == list->max_num) ? node_list_resize(list) : 0;
 }
 
-/*
- * 本地 server 节点的线程也需要启动，因为本地节点需要把其他的 kmod 节点数据转发
- * 到共享这个 server 节点的其他 kmod 节点中
- */
 void node_list_run(struct node_list *node_list)
 {
 	int idx;
 	struct node *node;
 
 	for(idx = 0; idx < node_list->node_num; idx++) {
+		if(idx == node_list->local_node_id) {
+			continue;
+		}
+
 		node = node_list->nodes[idx];
 		thread_run(node->data_worker);
 		thread_run(node->meta_worker);
+		thread_run(node->worker);
 	}
 }
 
-static struct packet *handler_recv(int fd)
-{
-	struct packet *pkt = NULL;
-
-#ifdef HADM_COMPRESS
-	{
-		struct z_packet *z_pkt;
-		z_pkt = z_packet_recv(fd);
-		if (!z_pkt)
-			goto out;
-		pkt = unpack_z_packet(z_pkt);
-		free_z_packet(z_pkt);
-	}
-#else
-	pkt = packet_recv(fd);
-#endif
-
-	return pkt;
-}
-
-static void node_data_handle_force_cb(void *data)
-{
-	struct node *node = data;
-
-	if (!node->data_event)
-		return;
-
-	log_error("%s: resume force add event for node %d", __func__, node->id);
-	if (event_add(node->data_event, NULL) < 0) {
-		log_error("failed to add data event on node %d", node->id);
-		node_del_data_event(node);
-	}
-}
-
-/* 从对端 server 的 data 链路收到数据，把它放到对应的 kmod 节点中 */
 void node_data_handler(evutil_socket_t fd, short event, void *args)
 {
 	struct node *node;
 	struct daemon *daemon;
-	struct device_list *dev_list;
 	struct device *dev;
+#ifdef HADM_COMPRESS
+	struct z_packet *pkt;
+#else
 	struct packet *pkt;
-	struct packet *pkt_clone;
-	int i, ret, full;
-	cb_fn *cb;
+#endif
 
 	node = (struct node *)args;
 	daemon = node->daemon;
-	dev_list = daemon->dev_list;
+	dev = daemon->dev;
 
-	pkt = handler_recv(node->dfd);
-	if (!pkt) {
+#ifdef HADM_COMPRESS
+	pkt = z_packet_recv(node->dfd);
+#else
+	pkt = packet_recv(node->dfd);
+#endif
+
+	if(pkt == NULL) {
 		node_del_data_event(node);
-		log_error("receive data from server node %d failed", node->id);
-		return;
-	}
+	} else {
+#ifdef HADM_COMPRESS
+		node_put_work_packet(node, unpack_z_packet(pkt));
+		free_z_packet(pkt);
+#else
+		log_debug("<<<<< recv data packet from %s %d (%s)", node_type_name[pkt->node_type], pkt->node_from, node->remote_ip);
+		log_packet_header(pkt);
 
-	/* FIXME 如果某个device的queue满了，在这里就会等待，从而造成两个问题：
-	 *	1. 这是event的call back函数，如果等待会造成event base的阻塞
-	 *	2. 单个device队列满而影响到所有其它device，不公平
-	 * 是否可以这样？
-	 *   提前获取队列一个空位，如果失败的话，直接返回，
-	 *   当队列有剩余空间时再加入该event
-	 * 但是，device互相影响的问题还是没能解决，满了直接断连？
-	 */
-	full = 0;
-	for (i = 0; i < dev_list->dev_num; i++) {
-		//FIXME 查找效率很低，可考虑序号对应下标，并且判读是否是只有单个device
-		dev = dev_list->devs[i];
-		if (!device_is_target(dev, pkt->kmod_to))
-			continue;
-		if (!device_want_recv(dev))
-			continue;
-		pkt_clone = packet_clone(pkt);
-		if (!pkt_clone) {
-			log_error("send to kmod node %d failed: no memory", dev->id);
-			free_packet(pkt_clone);
-			goto out;
-		}
-		cb = full ? NULL : node_data_handle_force_cb;
-		ret = dev_put_data_packet_force(dev, pkt_clone, cb, node);
-		if (ret < 0) {
-			log_error("kmod node %d data queue is NOT start", dev->id);
-			goto out;
-		} else if (ret > 0) {
-			log_info("%s force handle for node %d", __func__, node->id);
-			full = 1;
-		}
-	}
-
-out:
-	free_packet(pkt);
-	if (!full) {
-		ret = event_add(node->data_event, NULL);
-		if (ret < 0) {
-			log_error("failed to add data event on node %d", node->id);
-			node_del_data_event(node);
-		}
+		node_put_work_packet(node, pkt);
+#endif
 	}
 }
 
 void node_meta_handler(evutil_socket_t fd, short event, void *args)
 {
 	struct node *node;
-	struct daemon *daemon;
-	struct device_list *dev_list;
-	struct device *dev;
+#ifdef HADM_COMPRESS
+	struct z_packet *pkt
+#else
 	struct packet *pkt;
-	struct packet *pkt_clone;
-	int i, ret;
+#endif
 
 	node = (struct node *)args;
-	daemon = node->daemon;
-	dev_list = daemon->dev_list;
 
-	pkt = handler_recv(node->mfd);
-	if (!pkt) {
-		log_error("failed to receive meta from server node %d on mfd %d",
-			  node->id, node->mfd);
+#ifdef HADM_COMPRESS
+	pkt = z_packet_recv(node->mfd);
+#else
+	pkt = packet_recv(node->mfd);
+#endif
+
+	if(pkt == NULL) {
 		node_del_meta_event(node);
-		return;
-	}
+	} else {
+#ifdef HADM_COMPRESS
+		node_put_work_packet(node, unpack_z_packet(pkt));
+		free_z_packet(pkt);
+#else
+		log_debug("<<<<< recv meta packet from %s %d (%s)", node_type_name[pkt->node_type], pkt->node_from, node->remote_ip);
+		log_packet_header(pkt);
 
-	ret = node_meta_packet_handler(node, pkt);
-	if (ret < 0) {
-		log_warn("WARNING: handle packet %s return %d",
-			 packet_name[pkt->type], ret);
-	}
-
-out:
-	ret = event_add(node->meta_event, NULL);
-	if (ret < 0) {
-		log_error("failed to add data event on node %d", node->id);
-		node_del_meta_event(node);
+		node_put_work_packet(node, pkt);
+#endif
 	}
 }
 
@@ -763,22 +659,30 @@ void ping_timer_cb(evutil_socket_t fd, short event, void *args)
 {
 	struct node *node;
 	struct node_list *node_list;
-	struct node *local_node;
 	struct daemon *daemon;
 	struct packet *pkt;
+	int packet_type;
+	int node_from;
 
 	node = (struct node *)args;
 	daemon = node->daemon;
-	node_list = daemon->node_list;
-	local_node = daemon->local_node;
+	if (node->type == LOCAL_NODE) {
+		node_list = daemon->lnode_list;
+		node_from = daemon->local_node->id;
+		packet_type = P_NC_PING;
+	} else {
+		pthread_spin_lock(&daemon->rnode_list_lock);
+		node_list = daemon->rnode_list;
+		pthread_spin_unlock(&daemon->rnode_list_lock);
+		node_from = daemon->local_site_id;
+		packet_type = P_SC_PING;
+	}
 
 	if(node->meta_conn_state == NODE_MFD_DISCONNECTED) {
 		return;
 	}
 
-	if(node->ping >= node_list->pingtimeout) {
-		log_error("Error: %s node %d ping reach timeout count",
-				__func__, node->id);
+	if (node->ping_count >= node->max_ping_count) {
 		node_del_data_event(node);
 		node_del_meta_event(node);
 
@@ -786,55 +690,59 @@ void ping_timer_cb(evutil_socket_t fd, short event, void *args)
 	}
 
 	pkt = alloc_packet0();
-	pkt->type = P_META_PING;
-	pkt->node_from = local_node->id;
+	pkt->type = packet_type;
+	pkt->node_type = node->type;
+	pkt->node_from = node_from;
 	packet_set_node_to(node->id, pkt);
 
-	node->ping++;
-	if(node_put_meta_packet(node, pkt) < 0){
-		log_error("Error: %s node %d meta queue push failed.\n",
-				__func__, node->id);
-		free_packet(pkt);
-		node_del_data_event(node);
-		node_del_meta_event(node);
-
-		return;
-
-	}
+	node->ping_count++;
+	node_put_meta_packet(node, pkt);
 
 	timer_add_tb(daemon->timer_base, node->ping_timer);
 }
 
-int node_put_data_packet_force(struct node *node, struct packet *pkt,
-		cb_fn *callback, void *data)
+int node_put_work_packet(struct node *node, struct packet *pkt)
 {
-	int ret;
 	struct entry *e;
 
-	e = create_cb_entry(pkt, callback, data);
-	if (!e)
+	if (!pkt->node_to)
 		return -1;
-	ret = queue_put_force(e, node->data_q);
-	if (ret < 0)
-		free_entry(e);
+	e = create_entry(pkt);
+	if(e == NULL) {
+		return -1;
+	}
 
-	return ret;
+	return queue_put(e, node->work_q);
+}
+
+struct packet *node_get_work_packet(struct node *node)
+{
+	struct entry *e;
+	struct packet *pkt;
+
+	e = queue_get(node->work_q);
+	if(e == NULL) {
+		return NULL;
+	}
+
+	pkt = (struct packet *)e->data;
+	free_entry(e);
+
+	return pkt;
 }
 
 int node_put_data_packet(struct node *node, struct packet *pkt)
 {
 	struct entry *e;
 
+	if (!pkt->node_to)
+		return -1;
 	e = create_entry(pkt);
 	if(e == NULL) {
 		return -1;
 	}
 
-	if(queue_put(e, node->data_q) < 0){
-		free_entry(e);
-		return -1;
-	}
-	return 0;
+	return queue_put(e, node->data_q);
 }
 
 struct packet *node_get_data_packet(struct node *node)
@@ -857,18 +765,14 @@ int node_put_meta_packet(struct node *node, struct packet *pkt)
 {
 	struct entry *e;
 
+	if (!pkt->node_to)
+		return -1;
 	e = create_entry(pkt);
 	if(e == NULL) {
-		log_error("Error: %s node %d alloc entry failed",
-				__func__, node->id);
 		return -1;
 	}
 
-	if(queue_put(e, node->meta_q) < 0){
-		free_entry(e);
-		return -1;
-	}
-	return 0;
+	return queue_put(e, node->meta_q);
 }
 
 struct packet *node_get_meta_packet(struct node *node)
@@ -887,32 +791,31 @@ struct packet *node_get_meta_packet(struct node *node)
 	return pkt;
 }
 
-void pr_node(struct node *node)
+void log_node(struct node *node)
 {
-	printf("\tid: %d\n", node->id);
-	printf("\tshare_node_bits: 0x%x\n", node->share_node_bits);
-	printf("\thostname: %s\n", node->hostname);
-	printf("\tlocalip: %s, localport: %s\n", node->local_ip, node->local_port);
-	printf("\tremoteip: %s, remoteport: %s\n", node->remote_ip, node->remote_port);
-	printf("\tdfd: %d(%s), mfd: %d(%s)\n", node->dfd, connect_state[node->data_conn_state],
-	       node->mfd, connect_state[node->meta_conn_state]);
-	printf("\tping: %d\n", node->ping);
+	log_debug("NODE: |id:%d|type:%s|hostname:%s|local_ip:%s|local_port:%s|remote_ip:%s|remote_port:%s|dfd:%d,%s|mfd:%d,%s|pingcount:%d|",
+		  node->id, node_type_name[node->type], node->hostname,
+		  node->local_ip, node->local_port, node->remote_ip, node->remote_port,
+		  node->dfd, link_state_name[node->data_conn_state],
+		  node->mfd, link_state_name[node->meta_conn_state],
+		  node->ping_count);
 }
 
-void pr_node_list(struct node_list *node_list)
+void pr_node_list(struct node_list *list)
 {
 	int i;
 
-	printf("local_node_id: %d\n", node_list->local_node_id);
-	printf("ping: %d, pingtimeout: %d\n", node_list->ping, node_list->pingtimeout);
-	printf("max_num: %d, node_num: %d\n", node_list->max_num, node_list->node_num);
-
-	printf("nodes:\n");
-	for (i = 0; i < node_list->node_num; i++) {
+	printf("node_list:\n");
+	printf("\tlocal_node_id: %d\n", list->local_node_id);
+	printf("\tmax_num: %d\n", list->max_num);
+	printf("\tnode_num: %d\n", list->node_num);
+	for (i = 0; i < list->node_num; i++) {
 		struct node *node;
 
-		node = node_list->nodes[i];
-		pr_node(node);
-		printf("\n");
+		node = list->nodes[i];
+		printf("\tnode:\n");
+		printf("\t\tid: %d\n", node->id);
+		printf("\t\thostname: %s\n", node->hostname);
+		printf("\t\tremote_ip: %s, remote_port: %s\n", node->remote_ip, node->remote_port);
 	}
 }

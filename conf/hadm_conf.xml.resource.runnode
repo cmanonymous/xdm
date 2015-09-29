@@ -1,0 +1,102 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<hadm>
+  <global>
+    <serverip>127.0.0.1</serverip>
+    <serverport>9998</serverport>
+    <kmodport>12345</kmodport>
+    <ping>10</ping>
+    <pingtimeout>10</pingtimeout>
+  </global>
+
+  <sites>
+    <site>
+      <id>0</id>
+      <mode>share</mode>
+
+      <nodes>
+        <node>
+          <id>0</id>
+          <hostname>thinkpad-e430c</hostname>
+          <ipaddr>192.168.9.62</ipaddr>
+          <port>9999</port>
+        </node>
+      </nodes>
+    </site>
+
+    <site>
+      <id>1</id>
+      <mode>share</mode>
+
+      <nodes>
+        <node>
+          <id>0</id>
+          <hostname>u156</hostname>
+          <ipaddr>192.168.10.156</ipaddr>
+          <port>9999</port>
+        </node>
+      </nodes>
+    </site>
+  </sites>
+
+  <resources>
+
+    <resource>
+      <id>0</id>
+      <name>hadm0</name>
+      <runsites>
+        <runsite>
+          <id>0</id>
+          <ip>192.168.8.8</ip>
+          <port>8811</port>
+          <protocol>async</protocol>
+          <disk>/dev/hadm/bdev</disk>
+          <bwr_disk>/dev/hadm/bwr</bwr_disk>
+          <runnodes>
+            <id>0</id>
+          </runnodes>
+        </runsite>
+        <runsite>
+          <id>1</id>
+          <ip>192.168.9.9</ip>
+          <port>8822</port>
+          <protocol>async</protocol>
+          <disk>/dev/hadm/bdev</disk>
+          <bwr_disk>/dev/hadm/bwr</bwr_disk>
+          <runnodes>
+            <id>0</id>
+          </runnodes>
+        </runsite>
+      </runsites>
+    </resource>
+
+    <resource>
+      <id>1</id>
+      <name>hadm1</name>
+      <runsites>
+        <runsite>
+          <id>0</id>
+          <ip>192.168.6.6</ip>
+          <port>8880</port>
+          <protocol>async</protocol>
+          <disk>/dev/hadm/bdev</disk>
+          <bwr_disk>/dev/hadm/bwr</bwr_disk>
+          <runnodes>
+            <id>0</id>
+          </runnodes>
+        </runsite>
+        <runsite>
+          <id>1</id>
+          <ip>192.168.7.7</ip>
+          <port>8880</port>
+          <protocol>async</protocol>
+          <disk>/dev/hadm/bdev</disk>
+          <bwr_disk>/dev/hadm/bwr</bwr_disk>
+          <runnodes>
+            <id>0</id>
+          </runnodes>
+        </runsite>
+      </runsites>
+    </resource>
+
+  </resources>
+</hadm>

@@ -7,23 +7,18 @@
 #include "hadm_def.h"
 #include "hadm_socket.h"
 #include "hadm_device.h"
-#include "hadm_node.h"
+#include "hadm_site.h"
 #include "hadm_packet.h"
 #include "hadm_struct.h"
-#include "hadm_config.h"
 
+/* FIXME: why need this? */
 int hadm_socket_set_timeout(struct socket *sock,int timeout)
 {
         struct timeval t = { timeout, 0 };
 	int ret=0;
 	return 0;
-//	local_irq_disable();
-	if(in_irq()){
-		return 0;
-	}
         ret=kernel_setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (void *)&t, sizeof(t))  +
 		kernel_setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, (void *)&t, sizeof(t));
-//	local_irq_enable();
 	if(0) {
 		if((unsigned long)sock==(unsigned long)g_hadm->ctrl_net->sock){
 			pr_info("set ctrl net timeout to %d,ret=%d\n",timeout,ret);
@@ -45,6 +40,7 @@ struct socket *hadm_socket_connect(char *ip, uint16_t port)
 	ret = sock_create_kern(PF_INET, SOCK_STREAM, IPPROTO_TCP, &c_sock);
 	if (ret || !c_sock)
 		return ret ? ERR_PTR(ret) : c_sock;
+	hadm_socket_set_timeout(c_sock,5);
 	memset(&s_addr, 0, sizeof(s_addr));
 	s_addr.sin_family = PF_INET;
 	s_addr.sin_port = htons(port);
@@ -70,11 +66,12 @@ int hadm_socket_receive(struct socket *c_sock, char *buf, size_t buflen)
 	/* msg.msg_flags = MSG_DONTWAIT | MSG_NOSIGNAL; */
 	msg.msg_flags = MSG_NOSIGNAL;
 
+	//hadm_socket_set_timeout(c_sock,5);
 	while (nbytes_rcv < buflen) {
 		ret = kernel_recvmsg(c_sock, &msg, &vec, 1, (buflen - nbytes_rcv), msg.msg_flags);
-#if 0
+#if 1
 		if (ret == -EAGAIN) {
-			pr_debug("read again\n");
+			pr_info("read again\n");
 			continue;
 		}
 #endif
@@ -91,25 +88,43 @@ int hadm_socket_receive(struct socket *c_sock, char *buf, size_t buflen)
 	return nbytes_rcv;
 }
 
-
-int hadm_net_connected(struct hadm_net *net)
+int hadm_socket_recvv(struct socket *sock, struct kvec *vec, int count, size_t size)
 {
-	return hadm_net_get_state(net) == NET_CONNECTED;
-}
+	int ret;
+	int remain;
+	struct msghdr msg = { .msg_flags = MSG_NOSIGNAL };
 
-int hadm_net_closed(struct hadm_net *net)
-{
-	return hadm_net_get_state(net) == NET_CLOSED;
+	remain = size;
+	while (remain > 0) {
+		ret = kernel_recvmsg(sock, &msg, vec,
+				count, remain, msg.msg_flags);
+		if (ret == -EAGAIN) {
+			pr_err("%s: return EAGAIN\n", __FUNCTION__);
+			continue;
+		}
+		if (ret < 0) {
+			pr_err("%s: return %d.(count:%d|size:%ld|remain:%d\n",
+					__func__, ret, count, size, remain);
+			return ret;
+		} else if (ret == 0)
+			return -ENOTCONN;
+
+		remain -= ret;
+	}
+
+	return size;
 }
 
 int hadm_net_receive(struct hadm_net *net, char *buf, size_t buflen)
 {
 	int ret;
-	if(!hadm_net_connected(net)){
+
+	if (net->sock == NULL || IS_ERR(net->sock)) {
 		ret = -ENOTCONN;
 		goto done;
 	}
 	ret = hadm_socket_receive(net->sock, buf, buflen);
+
 done:
 	return ret;
 }
@@ -143,11 +158,53 @@ int hadm_socket_send(struct socket *sock, void *data, size_t size)
 	return sent;
 }
 
+int hadm_socket_sendv(struct socket *sock, struct kvec *vec, int count,
+		int size)
+{
+	int i;
+	int ret;
+	int remain;
+	int vec_idx;
+	struct msghdr msg = { .msg_flags = MSG_NOSIGNAL };
+
+	vec_idx = 0;
+	remain = size;
+	while (remain > 0) {
+		//ret = kernel_sendmsg(sock, &msg, vec, count, (size - sent));
+		ret = kernel_sendmsg(sock, &msg, &vec[vec_idx],
+				count - vec_idx, remain);
+		if (ret == -EAGAIN) {
+			pr_err("%s: return EAGAIN\n", __FUNCTION__);
+			continue;
+		}
+		if (ret <= 0) {
+			pr_err("%s: return %d\n", __FUNCTION__, ret);
+			return ret;
+		}
+
+		remain -= ret;
+
+		for (i = vec_idx; i < count; i++) {
+			if (ret >= vec[i].iov_len) {
+				ret -= vec[i].iov_len;
+			} else {
+				vec[i].iov_len -= ret;
+				vec[i].iov_base += ret;
+				vec_idx = i;
+				break;
+			}
+		}
+	}
+
+	return size;
+}
+
+/*
 int hadm_net_send(struct hadm_net *net, void *data, size_t size)
 {
 	int sent = 0;
 
-	if (!hadm_net_connected(net)) {
+	if (!hadm_socket_has_connected(net)) {
 		sent = -ENOTCONN;
 		goto done;
 	}
@@ -156,6 +213,7 @@ int hadm_net_send(struct hadm_net *net, void *data, size_t size)
 done:
 	return sent;
 }
+*/
 
 struct socket *hadm_socket_listen(uint16_t port)
 {
@@ -185,7 +243,7 @@ struct socket *hadm_socket_listen(uint16_t port)
 	return sock;
 }
 
-struct hadm_net *hadm_net_create(const char *ipaddr, const int port, int gfp_mask)
+struct hadm_net *hadm_net_create(int gfp_mask)
 {
 	struct hadm_net *net;
 
@@ -194,7 +252,8 @@ struct hadm_net *hadm_net_create(const char *ipaddr, const int port, int gfp_mas
 		return ERR_PTR(-ENOMEM);
 	net->sock = NULL;
 	net->connect_type = 0;
-	__hadm_net_set_state(net, NET_DISCONNECTED);
+
+	net->cstate = NET_DISCONNECTED;
 	mutex_init(&net->cstate_lock);
 	atomic_set(&net->refcnt, 0);
 
@@ -203,12 +262,37 @@ struct hadm_net *hadm_net_create(const char *ipaddr, const int port, int gfp_mas
 		kfree(net);
 		return ERR_PTR(-ENOMEM);
 	}
-	snprintf(net->conf->ipaddr, sizeof(net->conf->ipaddr), "%s", ipaddr);
-	net->conf->port = port;
+	strcpy(net->conf->ipaddr, "127.0.0.1");
+	net->conf->port = DATA_PORT;
 
 	return net;
 }
 
+void hadm_net_shutdown(struct hadm_net *net, enum sock_shutdown_cmd how)
+{
+        int connected;
+
+        connected = hadm_socket_has_connected(net);
+        if (!connected)
+                return;
+
+	kernel_sock_shutdown(net->sock, how);
+
+	mutex_lock(&net->cstate_lock);
+	net->cstate = NET_CLOSED;
+	mutex_unlock(&net->cstate_lock);
+}
+
+int hadm_net_closed(struct hadm_net *net)
+{
+	int ret;
+
+	mutex_lock(&net->cstate_lock);
+	ret = net->cstate == NET_CLOSED;
+	mutex_unlock(&net->cstate_lock);
+
+	return ret;
+}
 
 void hadm_socket_close(struct socket *sock)
 {
@@ -232,11 +316,10 @@ struct hadm_net *find_hadm_net_by_type(int type)
 		hadm_net = g_hadm->data_net;
 		break;
 	case P_CMD_TYPE:
+	default:
 		hadm_net = NULL;
 		break;
-	default:
-		hadm_net = ERR_PTR(-EINVAL);
-		break;
+		//hadm_net = ERR_PTR(-EINVAL);
 	}
 
 	return hadm_net;
@@ -244,37 +327,37 @@ struct hadm_net *find_hadm_net_by_type(int type)
 
 void hadm_net_close(struct hadm_net *net)
 {
-	if(IS_ERR_OR_NULL(net)){
-		return ;
-	}
 	mutex_lock(&net->cstate_lock);
-	__hadm_net_set_state(net, NET_CLOSED);
-
+	net->cstate = NET_DISCONNECTED;
 	if (net->sock != NULL && !IS_ERR(net->sock)) {
 		kernel_sock_shutdown(net->sock, SHUT_RDWR);
+		sock_release(net->sock);
+		net->sock = NULL;
 	}
 	mutex_unlock(&net->cstate_lock);
 }
 
 void hadm_net_release(struct hadm_net *net)
 {
-	if(!hadm_net_closed(net)){
-		pr_warn("%s: release a unclosed socket., net(%p) state = %d\n",
-				__FUNCTION__, net, net ? hadm_net_get_state(net) : 0);
-		pr_info("%s: ctrl_net = %p, data_net = %p\n",
-				__FUNCTION__, g_hadm->ctrl_net, g_hadm->data_net);
-		BUG();
-	}
-	if(!IS_ERR_OR_NULL(net)) {
-		if(!IS_ERR_OR_NULL(net->sock)){
-			hadm_socket_release(net->sock);
-		}
-		if(net->conf){
-			kfree(net->conf);
-		}
+	if (net != NULL && !IS_ERR(net)) {
+		hadm_net_close(net);
+		kfree(net->conf);
 		kfree(net);
-
 	}
+}
+
+int hadm_socket_has_connected(struct hadm_net *net)
+{
+	int connected;
+
+	if (net == NULL || IS_ERR(net))
+		return 0;
+
+	mutex_lock(&net->cstate_lock);
+	connected = (net->cstate == NET_CONNECTED) && net->sock != NULL && !IS_ERR(net->sock);
+	mutex_unlock(&net->cstate_lock);
+
+	return connected;
 }
 
 static int hadm_do_handshake(struct hadm_net *net)
@@ -286,7 +369,6 @@ static int hadm_do_handshake(struct hadm_net *net)
 	memset(&pkt_buf, 0, sizeof(pkt_buf));
 	pkt_buf.len = 0;
 	pkt_buf.type = net->connect_type;
-	pkt_buf.kmod_from = get_kmod_id();
 
 	mutex_lock(&net->cstate_lock);
 
@@ -300,7 +382,7 @@ static int hadm_do_handshake(struct hadm_net *net)
 
 	ret = hadm_socket_receive(net->sock, (char *)&pkt_buf, pack_size);
 	if (ret != pack_size) {
-		dump_packet("hadm_do_handshake", &pkt_buf);
+		//dump_packet("hadm_do_handshake", &pkt_buf);
 		ret = -1;
 		goto done;
 	}
@@ -318,28 +400,33 @@ static int hadm_do_handshake(struct hadm_net *net)
 		ret = -1;
 		goto done;
 	}
-	__hadm_net_set_state(net, NET_CONNECTED);
+
+	net->cstate = NET_CONNECTED;
 done:
 	mutex_unlock(&net->cstate_lock);
 	return ret;
 }
 
+/* FIXME error code */
 int hadm_connect_server(void *arg)
 {
 	struct hadm_net *net;
 	struct socket *sock;
 
 	net = (struct hadm_net *)arg;
-//	pr_info("net(sock=%p) connect to server %s:%d\n", net->sock, net->conf->ipaddr, net->conf->port);
 
-	if (!hadm_net_socket_released(net))
+	if (!hadm_net_socket_released(net)) {
+		pr_debug("%s sock not release. wait.\n", __FUNCTION__);
 		return -ENOTCONN;
+	}
 	sock = hadm_socket_connect(net->conf->ipaddr, net->conf->port);
-	if (IS_ERR(sock))
+	if (IS_ERR(sock)) {
+		pr_debug("%s: connect to server failed.%ld.\n", __FUNCTION__, PTR_ERR(sock));
 		return PTR_ERR(sock);
+	}
 	hadm_net_set_socket(net, sock);
 	if (hadm_do_handshake(net) < 0) {
-		pr_info("%s connect server, handshake faild.\n", __FUNCTION__);
+		pr_debug("%s connect server, handshake faild.\n", __FUNCTION__);
 		hadm_net_close_socket(net);
 		return -ENOTCONN;
 	}

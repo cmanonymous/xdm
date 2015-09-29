@@ -7,8 +7,12 @@ void *thread_function(void *data)
 	signal(SIGPIPE, SIG_IGN);
 
 	thr = (struct thread *)data;
+	log_info("thread %s try to run %s(pointer=%p, arg=%p)",
+		 thr->name, thr->funcname, thr->function, thr->data);
 	thr->function(data);
 
+	log_info("thread %s finish %s(pointer=%p, arg=%p)",
+		 thr->name, thr->funcname, thr->function, thr->data);
 	thr->state = THREAD_STOP;
 
 	return NULL;
@@ -29,7 +33,7 @@ struct thread *alloc_thread()
 	return thr;
 }
 
-struct thread *create_thread(thread_fun function, void *data)
+struct thread *create_thread(char *name, char *funcname, thread_fun function, void *data)
 {
 	struct thread *thr;
 
@@ -40,6 +44,11 @@ struct thread *create_thread(thread_fun function, void *data)
 
 	thr->function = function;
 	thr->data = data;
+	snprintf(thr->name, sizeof(thr->name), "%s", name);
+	snprintf(thr->funcname, sizeof(thr->funcname), "%s", funcname);
+
+	log_info("create thread %s bind to function %s(pointer=%p, arg=%p)",
+		 thr->name, thr->funcname, thr->function, thr->data);
 
 	return thr;
 }
@@ -51,15 +60,19 @@ void free_thread(struct thread *thr)
 
 int thread_run(struct thread *thr)
 {
-	pthread_attr_t attr;
-	pthread_attr_init(&attr);
-	pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+	int ret;
+
 	if(thr->state == THREAD_RUN) {
 		return 0;
 	}
 
 	thr->state = THREAD_RUN;
-	return pthread_create(&thr->thr, &attr, thread_function, thr);
+	ret = pthread_create(&thr->thr, NULL, thread_function, thr);
+	if (ret < 0) {
+		log_error("%s: create thread failed.(%d)",__func__, ret);
+		thr->state = THREAD_STOP;
+	}
+	return ret;
 }
 
 int thread_stop(struct thread *thr)

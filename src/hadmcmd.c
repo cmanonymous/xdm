@@ -7,48 +7,6 @@
 
 extern char *progname;
 
-static int __do_common_cmd(int fd, int argc, char *argv[], struct config *cfg,
-		struct command *subcmd)
-{
-        int ret;
-        struct res_config *res;
-        struct packet *pkt;
-
-        if(argc != 1) {
-                log_error("error: command need a arguement.");
-                return -ECMD_WRONG_USAGE;
-        }
-
-        res = find_res_by_name(argv[0], cfg);
-        if(res == NULL) {
-                log_error("error: can not find the resource.");
-                return -ECMD_NO_RESOURCE;
-        }
-
-        pkt = alloc_packet0();
-        if(pkt == NULL) {
-                log_error("error: allocate packet error.");
-                return -ECMD_NOMEM;
-        }
-
-        pkt->type = subcmd->type;
-        pkt->dev_id = res->id;
-
-        ret = packet_send(fd, pkt);
-        if (ret < 0) {
-                log_error("error: send packet to kernel error.");
-                ret = -ECMD_NET_ERROR;
-                goto out;
-        }
-
-        ret = check_response(fd);
-
-out:
-        close(fd);
-        free_packet(pkt);
-        return ret;
-}
-
 static struct option init_options[] = {
 	{"local-id", 1, 0, 0},
 	{"local-uuid", 1, 0, 0},
@@ -153,13 +111,10 @@ int do_init(int fd, int argc, char *argv[], struct config *cfg, struct command *
         int init_argv_len = argc + 2; /* 2 for init and NULL */
         char *init_argv[init_argv_len];
 
-	if (fd > 0) {
-		ret = __do_common_cmd(fd, argc, argv, cfg, subcmd);
-		if (ret < 0) {
-			log_error("%s: init device failed.\n", __func__);
-			return ret;
-		}
-	}
+        if (check_module()) {
+                log_error("error: kmod exist.");
+                return -ECMD_KMOD_EXIST;
+        }
 
         init_argv[0] = "init";
         for (n = 1; n < init_argv_len - 1; n++)
@@ -168,32 +123,31 @@ int do_init(int fd, int argc, char *argv[], struct config *cfg, struct command *
 
         __get_resname_from_cmdline(init_argv_len - 1, init_argv, res_name, MAX_NAME_LEN);
         res = find_res_by_name(res_name, cfg);
-        if (res == NULL){
+        if (res == NULL) {
                 log_error("error: can not find this resource.");
                 return -ECMD_NO_RESOURCE;
         }
 
         ret = get_bwr_info(res, cfg, &data_max, &meta_offset, &dbm_offset,
                            &dbm_size, &bwr_offset, &bwr_disk_size);
-        if (ret == -1){
+        if (ret < 0) {
                 log_error("error: can not get bwr device meta info.");
                 return -ECMD_GET_BWRINFO;
         }
 
-        ret = get_res_path(res, cfg, cfg->local_node_id, dev_name, bwr_name);
-        if (ret == -1){
+        ret = get_res_path(res, cfg->local_site_id, dev_name, bwr_name);
+        if (ret < 0) {
                 log_error("error: can not find the resource path.");
                 return -ECMD_NO_PATH;
         }
-        res_fd = open(bwr_name, O_RDWR);
-//	|O_SYNC);
-        if (res_fd == -1){
+        res_fd = open(bwr_name, O_RDWR | O_SYNC);
+        if (res_fd < 0) {
                 log_error("error: open device error: %s.", strerror(errno));
                 return -ECMD_OPEN_FAIL;
         }
 
         content = malloc(BUFSIZ);
-        if (content == NULL){
+        if (content == NULL) {
                 log_error("error: initial bwr device error. Not enough memory.");
                 ret = -ECMD_NOMEM;
                 goto out;
@@ -216,12 +170,10 @@ int do_init(int fd, int argc, char *argv[], struct config *cfg, struct command *
         for (i = 0; i < MAX_NODES; i++) {
             bwr_meta->head[i] = INVALID_SECTOR;
         }
-        for (i = 0; i < res->runnode_num; i++) {
-            struct runnode_config *runnode;
-	    struct node_config *node;
-            runnode = &res->runnodes[i];
-	    node = find_node_by_id(cfg, runnode->id);
-            bwr_meta->head[node->server_id] = bwr_offset;
+        for (i = 0; i < res->runsite_num; i++) {
+            struct runsite_config *runsite;
+            runsite = &res->runsites[i];
+            bwr_meta->head[runsite->id] = bwr_offset;
         }
         bwr_meta->tail = bwr_offset;
         bwr_meta->disk_state = D_CONSISTENT;
@@ -252,7 +204,6 @@ int do_init(int fd, int argc, char *argv[], struct config *cfg, struct command *
 fmem:
         free(content);
 out:
-	fsync(res_fd);
         close(res_fd);
         return ret;
 }
@@ -316,9 +267,50 @@ void __do_config_usage()
         log_error("usage: hadmctl config");
 }
 
+int common_device_up(int fd, int argc, char *argv[], struct config *cfg, struct command *subcmd)
+{
+        int ret;
+        struct res_config *res;
+        struct packet *pkt;
+
+        if(argc != 1) {
+                log_error("error: command need a arguement.");
+                return -ECMD_WRONG_USAGE;
+        }
+
+        res = find_res_by_name(argv[0], cfg);
+        if(res == NULL) {
+                log_error("error: can not find the resource.");
+                return -ECMD_NO_RESOURCE;
+        }
+
+        pkt = alloc_packet0();
+        if(pkt == NULL) {
+                log_error("error: allocate packet error.");
+                return -ECMD_NOMEM;
+        }
+
+        pkt->type = subcmd->type;
+        pkt->dev_id = res->id;
+
+        ret = packet_send(fd, pkt);
+        if (ret < 0) {
+                log_error("error: send packet to kernel error.");
+                ret = -ECMD_NET_ERROR;
+                goto out;
+        }
+
+        ret = check_response(fd);
+
+out:
+        close(fd);
+        free_packet(pkt);
+        return ret;
+}
+
 int __do_up(int fd, int argc, char *argv[], struct config *cfg, struct command *subcmd)
 {
-        return __do_common_cmd(fd, argc, argv, cfg, subcmd);
+        return common_device_up(fd, argc, argv, cfg, subcmd);
 }
 
 void do_up_usage()
@@ -328,7 +320,7 @@ void do_up_usage()
 
 int do_down(int fd, int argc, char *argv[], struct config *cfg, struct command *subcmd)
 {
-        return __do_common_cmd(fd, argc, argv, cfg, subcmd);
+        return common_device_up(fd, argc, argv, cfg, subcmd);
 }
 
 void do_down_usage()
@@ -342,7 +334,6 @@ int do_status(int fd, int argc, char *argv[], struct config *cfg, struct command
         struct packet *pkt;
         struct res_config *res;
 
-
         if (argc != 1) {
                 log_error("error: command need a arguement.");
                 return -ECMD_WRONG_USAGE;
@@ -354,15 +345,14 @@ int do_status(int fd, int argc, char *argv[], struct config *cfg, struct command
                 return -ECMD_NO_RESOURCE;
         }
 
-        ret = get_status(cfg, res, &pkt);
+        ret = get_status(fd, cfg, res, &pkt);
         if (ret < 0) {
                 return ret;
         }
 
         if (pkt->errcode != 0) {
                 ret = pkt->errcode;
-                log_error("error: %s",
-                                hadm_str_errno[-ret]);
+                log_error("error: %s", hadm_str_errno[-ret]);
                 goto out;
         }
 
@@ -380,13 +370,12 @@ void do_status_usage()
         log_error("usage: hadmctl status <res_name>");
 }
 
-
 int do_primary(int fd, int argc, char *argv[], struct config *cfg, struct command *subcmd)
 {
         int ret;
         struct res_config *res;
         struct packet *pkt;
-        struct node_state_packet *state_pkt;
+        struct site_state_packet *state_pkt;
 
         if (argc != 1) {
                 log_error("error: command need a parameter.");
@@ -400,7 +389,7 @@ int do_primary(int fd, int argc, char *argv[], struct config *cfg, struct comman
                 return -ECMD_NO_RESOURCE;
         }
 
-        ret = get_status(cfg, res, &pkt);
+        ret = get_status(-1, cfg, res, &pkt);
         if (ret < 0) {
                 return ret;
         }
@@ -419,7 +408,7 @@ int do_primary(int fd, int argc, char *argv[], struct config *cfg, struct comman
                 goto err;
         }
 
-        state_pkt = get_node_state(pkt, cfg->local_server_idx);
+        state_pkt = get_site_state(pkt, cfg->local_site_id);
         if (!state_pkt) {
                 ret = -ECMD_COMMON;
                 goto err;
@@ -435,7 +424,7 @@ int do_primary(int fd, int argc, char *argv[], struct config *cfg, struct comman
                 goto err;
         }
 
-        return __do_common_cmd(fd, argc, argv, cfg, subcmd);
+        return common_device_up(fd, argc, argv, cfg, subcmd);
 err:
         free(pkt);
         return ret;
@@ -451,7 +440,7 @@ int do_secondary(int fd, int argc, char *argv[], struct config *cfg, struct comm
         int idx, ret;
         int primary_id;
         struct packet *pkt;
-        struct node_state_packet *node_state_pkt, *iter;
+        struct site_state_packet *site_state_pkt, *iter;
         struct res_config *res;
 
         if (argc != 1) {
@@ -465,7 +454,7 @@ int do_secondary(int fd, int argc, char *argv[], struct config *cfg, struct comm
                 return -ECMD_NO_RESOURCE;
         }
 
-        ret = get_status(cfg, res, &pkt);
+        ret = get_status(-1, cfg, res, &pkt);
         if (ret < 0) {
                 return ret;
         }
@@ -483,7 +472,7 @@ int do_secondary(int fd, int argc, char *argv[], struct config *cfg, struct comm
         }
 
         free(pkt);
-        return __do_common_cmd(fd, argc, argv, cfg, subcmd);
+        return common_device_up(fd, argc, argv, cfg, subcmd);
 err:
         free(pkt);
         return ret;
@@ -525,7 +514,7 @@ void do_help_usage()
         log_error("usage: hadmctl help [command].");
 }
 
-int common_sync(int fd, struct command *subcmd, struct res_config *res, struct node_state_packet *node)
+int common_sync(int fd, struct command *subcmd, struct res_config *res, struct site_state_packet *node)
 {
         int ret;
         struct packet *pkt;
@@ -556,45 +545,30 @@ out:
 }
 
 int common_sync_check(int argc, char *argv[], struct config *cfg,
-                struct res_config **res, struct node_state_packet **node_state)
+                struct res_config **res, struct site_state_packet **site_state)
 {
         int ret;
         struct packet *pkt;
-	struct server_config *server;
-        struct node_config *node;
-	int server_id = argv[1] ? atoi(argv[1]) : -1;
+        struct site_config *site;
 
         if (argc != 2 && argc != 3) {
                 log_error("error: command need a resource followed by a host id.");
                 return -ECMD_WRONG_USAGE;
         }
 
-	if (strlen(argv[1]) != (server_id > 10 ? 2 : 1)
-			|| (!server_id && argv[1][0] != '0')) {
-		log_error("error: wrong node id");
-		return -ECMD_WRONG_USAGE;
-	}
-
-	*res = find_res_by_name(argv[0], cfg);
+        *res = find_res_by_name(argv[0], cfg);
         if (*res == NULL) {
                 log_error("error: can not find the resource.");
                 return -ECMD_NO_RESOURCE;
         }
-	server = find_server_by_id(cfg, server_id);
-	if(server == NULL || !server_belong_res(cfg, server, *res)) {
-		log_error("error: can not find peer server.");
-		return -ECMD_NO_NODE;
-	}
-	/**
 
-        node = find_node(cfg, ++argv);
-        if (node == NULL || !node_belong_res(node, *res)) {
-                log_error("error: can not find the node.");
+        site = find_site(cfg, ++argv);
+        if (site == NULL || !site_belong_res(site, *res)) {
+                log_error("error: can not find the site.");
                 return -ECMD_NO_NODE;
         }
-	**/
 
-        ret = get_status(cfg, *res, &pkt);
+        ret = get_status(-1, cfg, *res, &pkt);
         if (ret < 0) {
                 return ret;
         }
@@ -610,8 +584,8 @@ int common_sync_check(int argc, char *argv[], struct config *cfg,
                 return -ECMD_RES_NOT_UP;
         }
 
-        *node_state = get_node_state(pkt, server->id);
-        if (*node_state == NULL) {
+        *site_state = get_site_state(pkt, site->id);
+        if (*site_state == NULL) {
                 log_error("error: can not get the node state.");
                 return -ECMD_NO_STATE;
         }
@@ -624,26 +598,26 @@ int do_fullsync(int fd, int argc, char *argv[], struct config *cfg, struct comma
         int ret;
         struct packet *pkt;
         struct res_config *res;
-        struct node_config *node;
-        struct node_state_packet *node_state;
+        struct site_config *site;
+        struct site_state_packet *site_state;
 
-        ret = common_sync_check(argc, argv, cfg, &res, &node_state);
+        ret = common_sync_check(argc, argv, cfg, &res, &site_state);
         if (ret < 0) {
                 return ret;
         }
 #if 0
-        if (node_state->n_state == N_DISCONNECT ||
-            node_state->c_state == C_DELTA_SYNC_DBM ||
-            node_state->c_state == C_DELTA_SYNC_BWR ||
-            node_state->c_state == C_CMSYNC_DBM) {
-                if (node_state->n_state == N_DISCONNECT)
+        if (site_state->n_state == N_DISCONNECT ||
+            site_state->c_state == C_DELTA_SYNC_DBM ||
+            site_state->c_state == C_DELTA_SYNC_BWR ||
+            site_state->c_state == C_CMSYNC_DBM) {
+                if (site_state->n_state == N_DISCONNECT)
                         log_error("error: network disconnect.");
                 else
                         log_error("error: conflict cstate.");
                 return -ECMD_CHECK_STATE_FAIL;
         }
 #endif
-        return common_sync(fd, subcmd, res, node_state);
+        return common_sync(fd, subcmd, res, site_state);
 }
 
 int do_delta_sync(int fd, int argc, char *argv[], struct config *cfg, struct command *subcmd)
@@ -651,28 +625,28 @@ int do_delta_sync(int fd, int argc, char *argv[], struct config *cfg, struct com
         int ret;
         struct packet *pkt;
         struct res_config *res;
-        struct node_config *node;
-        struct node_state_packet *node_state;
+        struct site_config *site;
+        struct site_state_packet *site_state;
 
-        ret = common_sync_check(argc, argv, cfg, &res, &node_state);
+        ret = common_sync_check(argc, argv, cfg, &res, &site_state);
         /* if (ret < 0) { */
         /*         return ret; */
         /* } */
 
-        /* if (node_state->n_state == N_DISCONNECT || node_state->c_state != C_DBM || */
-        /*                 node_state->bwr_size != 0 || node_state->dbm_set == 0) { */
-        /*         if (node_state->n_state == N_DISCONNECT) */
+        /* if (site_state->n_state == N_DISCONNECT || site_state->c_state != C_DBM || */
+        /*                 site_state->bwr_size != 0 || site_state->dbm_set == 0) { */
+        /*         if (site_state->n_state == N_DISCONNECT) */
         /*                 log_error("error: networt disconnect."); */
-        /*         else if (node_state->c_state != C_DBM) */
+        /*         else if (site_state->c_state != C_DBM) */
         /*                 log_error("error: need in dbm state."); */
-        /*         else if (node_state->bwr_size != 0) */
+        /*         else if (site_state->bwr_size != 0) */
         /*                 log_error("error: bwr size not empty."); */
         /*         else */
         /*                 log_error("error: no dbm generated."); */
         /*         return -ECMD_CHECK_STATE_FAIL; */
         /* } */
 
-        return common_sync(fd, subcmd, res, node_state);
+        return common_sync(fd, subcmd, res, site_state);
 }
 
 int do_cmsync(int fd, int argc, char *argv[], struct config *cfg, struct command *subcmd)
@@ -680,21 +654,21 @@ int do_cmsync(int fd, int argc, char *argv[], struct config *cfg, struct command
         int ret;
         struct packet *pkt;
         struct res_config *res;
-        struct node_config *node;
-        struct node_state_packet *node_state;
+        struct site_config *site;
+        struct site_state_packet *site_state;
 
-        ret = common_sync_check(argc, argv, cfg, &res, &node_state);
+        ret = common_sync_check(argc, argv, cfg, &res, &site_state);
         if (ret < 0) {
                 return ret;
         }
 
-		return common_sync(fd, subcmd, res, node_state);
+		return common_sync(fd, subcmd, res, site_state);
 
-        if (node_state->n_state == N_CONNECT && node_state->c_state == C_SPLITBRAIN) {
-                return common_sync(fd, subcmd, res, node_state);
+        if (site_state->n_state == N_CONNECT && site_state->c_state == C_SPLITBRAIN) {
+                return common_sync(fd, subcmd, res, site_state);
         }
         else {
-                if (node_state->n_state != N_CONNECT)
+                if (site_state->n_state != N_CONNECT)
                         log_error("error: network disconnet");
                 else
                         log_error("error: not in splitbrain state.");
@@ -733,7 +707,7 @@ void do_version_usage()
 
 int do_forceprimary(int fd, int argc, char *argv[], struct config *cfg, struct command *subcmd)
 {
-        return __do_common_cmd(fd, argc, argv, cfg, subcmd);
+        return common_device_up(fd, argc, argv, cfg, subcmd);
 }
 
 void do_forceprimary_usage()
@@ -742,7 +716,7 @@ void do_forceprimary_usage()
 
 int do_forcesecondary(int fd, int argc, char *argv[], struct config *cfg, struct command *subcmd)
 {
-        return __do_common_cmd(fd, argc, argv, cfg, subcmd);
+        return common_device_up(fd, argc, argv, cfg, subcmd);
 }
 
 void do_forcesecondary_usage()
@@ -765,7 +739,7 @@ int do_up(int fd, int argc, char *argv[], struct config *cfg, struct command *su
 		return -ECMD_NO_RESOURCE;
 	}
 
-        conf_pkt = pack_config_for_res(cfg, res);
+        conf_pkt = pack_config(cfg);
         if(conf_pkt == NULL) {
                 log_error("error: can not config the resource.");
                 return -ECMD_NO_RESOURCE;
@@ -782,7 +756,7 @@ int do_up(int fd, int argc, char *argv[], struct config *cfg, struct command *su
 	pkt->dev_id = res->id;
 
         ret = pack_fill_bwr(conf_pkt, cfg);
-        if (ret < 0){
+        if (ret < 0) {
                 log_error("error: fill the bwr info in packet failed.");
                 goto packet_err;
         }
@@ -794,7 +768,6 @@ int do_up(int fd, int argc, char *argv[], struct config *cfg, struct command *su
                 ret = -ECMD_NET_ERROR;
                 goto packet_err;
         }
-	ret = 0;
 
         pkt = packet_recv(fd);
         if (pkt == NULL) {
@@ -805,12 +778,9 @@ int do_up(int fd, int argc, char *argv[], struct config *cfg, struct command *su
 
         if (pkt->errcode !=0 && pkt->errcode != -EKMOD_ALREADY_UP) {
                 ret = pkt->errcode;
-
-                log_error("error: %s",
-                                hadm_str_errno[-ret]);
+                log_error("error: %s", hadm_str_errno[-ret]);
                 goto packet_err;
         }
-
 
 packet_err:
         free_packet(pkt);
@@ -823,7 +793,7 @@ conf_packet_err:
 int do_dump(int fd, int argc, char *argv[], struct config *cfg, struct command *subcmd)
 {
         int idx, bwr_fd, ret;
-        struct runnode_config *runnode;
+        struct runsite_config *runsite;
         struct res_config *res;
 
         char *content;
@@ -857,13 +827,13 @@ int do_dump(int fd, int argc, char *argv[], struct config *cfg, struct command *
                 return -ECMD_GET_BWRINFO;
         }
 
-        ret = get_res_path(res, cfg, cfg->local_node_id, dev_name, bwr_name);
+        ret = get_res_path(res, cfg->local_site_id, dev_name, bwr_name);
         if (ret == -1) {
                 log_error("error: can not find the resource path.");
                 return -ECMD_NO_PATH;
         }
 
-        bwr_fd = open(bwr_name, O_RDONLY|O_DIRECT);
+        bwr_fd = open(bwr_name, O_RDONLY | O_DIRECT);
         if (fd < 0) {
                 log_error("error: open device error: %s.", strerror(errno));
                 return -ECMD_OPEN_FAIL;
@@ -893,15 +863,13 @@ int do_dump(int fd, int argc, char *argv[], struct config *cfg, struct command *
         }
 
         pr_meta_info(content);
-        runnode = res->runnodes;
+        runsite = res->runsites;
         dbm_data = content + ((dbm_offset - meta_offset) << SECTOR_SIZE_BIT);
         printf("dbm_cnt:");
-	for (idx = 0; idx < cfg->server_num; idx++) {
-		struct server_config *server;
-		server = &cfg->servers[idx];
-		printf(" %d ", bits(dbm_data + ((dbm_size * server->id) << SECTOR_SIZE_BIT),
-				    dbm_size << SECTOR_SIZE_BIT));
-	}
+        for (idx = 0; idx < res->runsite_num; idx++) {
+                printf(" %d ", bits(dbm_data + ((dbm_size * runsite[idx].id) << SECTOR_SIZE_BIT)
+                                , dbm_size << SECTOR_SIZE_BIT));
+        }
         printf("\n");
 
         ret = 0;
@@ -917,137 +885,22 @@ void do_dump_usage()
         log_error("usage: hadmctl dump <res_name>");
 }
 
-int do_dumpbwr(int fd, int argc, char *argv[], struct config *cfg, struct command *subcmd)
+int do_master(int fd, int argc, char *argv[], struct config *cfg, struct command *subcmd)
 {
-        int idx, bwr_fd;
-	int64_t ret;
-        struct runnode_config *runnode;
-        struct res_config *res;
-
-        char *content;
-        char *meta_data;
-        char *dbm_data;
-        char dev_name[MAX_NAME_LEN] = {0};
-        char bwr_name[MAX_NAME_LEN] = {0};
-        uint64_t content_size;
-        uint64_t data_max;
-        uint64_t meta_offset;
-        uint64_t dbm_offset;
-        uint64_t dbm_size;
-        uint64_t bwr_offset;
-        uint64_t bwr_disk_size;
-	uint64_t bwr_sector;
-
-        if (argc != 2) {
-                log_error("error: command need a arguement.");
-                return -ECMD_WRONG_USAGE;
-        }
-	bwr_sector = atol(argv[1]);
-
-        res = find_res_by_name(argv[0], cfg);
-        if (res == NULL) {
-                log_error("error: can not find this resource.");
-                return -ECMD_NO_RESOURCE;
-        }
-
-        ret = get_bwr_info(res, cfg, &data_max, &meta_offset, &dbm_offset,
-                           &dbm_size, &bwr_offset, &bwr_disk_size);
-        if (ret == -1) {
-                log_error("error: can not get bwr device meta info.");
-                return -ECMD_GET_BWRINFO;
-        }
-
-	if(bwr_sector < bwr_offset || (bwr_sector - bwr_offset) % 9 != 0) {
-		log_error("error: invalid bwr_sector.");
-		return -ECMD_GET_BWRINFO;
-	}
-
-        ret = get_res_path(res, cfg, cfg->local_node_id, dev_name, bwr_name);
-        if (ret == -1) {
-                log_error("error: can not find the resource path.");
-                return -ECMD_NO_PATH;
-        }
-
-        bwr_fd = open(bwr_name, O_RDONLY | O_DIRECT);
-        if (fd < 0) {
-                log_error("error: open device error: %s.", strerror(errno));
-                return -ECMD_OPEN_FAIL;
-        }
-
-        ret = lseek64(bwr_fd, bwr_sector << SECTOR_SIZE_BIT, SEEK_SET);
-        if (ret < 0) {
-                log_error("error: lseek bwr device error: %s.", strerror(errno));
-                ret = -ECMD_IO_ERR;
-                goto f_free;
-        }
-
-        content_size = 512 + 4096;
-        ret = posix_memalign((void **)&content, BUFSIZ, content_size);
-        if (ret < 0) {
-                log_error("error: alloc mem failed. %s.", strerror(errno));
-                ret = -ECMD_NOMEM;
-                goto f_free;
-        }
-        memset(content, 0, content_size);
-
-        ret  = read(bwr_fd, content, content_size);
-        if (ret != content_size) {
-                perror("read data error:");
-                ret = -ECMD_IO_ERR;
-                goto m_free;
-        }
-
-        //pr_meta_info(content);
-        pr_bwr_meta_info(content);
-        printf("\n");
-
-        ret = 0;
-m_free:
-        free(content);
-f_free:
-        close(bwr_fd);
-        return ret;
+        return common_device_up(fd, argc, argv, cfg, subcmd);
 }
 
-void do_dumpbwr_usage()
+void do_master_usage()
 {
-        log_error("usage: hadmctl dumpbwr <res_name> <bwr sector>");
+	log_error("usage: hadmctl master <res_name>");
 }
 
-/* 需要传入三个参数给模块：节点 id，server ip，server port */
-int do_startkmod(int fd, int argc, char *argv[], struct config *cfg, struct command *subcmd)
+int do_slaver(int fd, int argc, char *argv[], struct config *cfg, struct command *subcmd)
 {
-        int hadm_local_id;
-        char arg1[40], arg2[40], arg3[40];
-        struct node_config *node_cfg;
-        struct server_config *server_cfg;
-	int ret;
-
-        hadm_local_id = cfg->local_node_id;
-        node_cfg = find_node_by_id(cfg, hadm_local_id);
-        if (!node_cfg) {
-                log_error("ERROR: no kmod node %d", hadm_local_id);
-                return -1;
-        }
-        server_cfg = find_server_by_id(cfg, node_cfg->server_id);
-        if (!server_cfg) {
-                log_error("ERROR: no server %d", node_cfg->server_id);
-                return -1;
-        }
-
-        snprintf(arg1, sizeof(arg1), "hadm_local_id=%d", hadm_local_id);
-        snprintf(arg2, sizeof(arg2), "hadm_server_ipaddr=%s", server_cfg->localipaddr);
-        snprintf(arg3, sizeof(arg3), "hadm_server_port=%s", server_cfg->localport);
-        ret = execlp("modprobe", "modprobe", MODULE_NAME, arg1, arg2, arg3, NULL);
-        if (ret < 0) {
-                perror("execlp\n");
-                return -1;
-        }
-
-        return 0;             /* 代码不会运行到这里，加上只是为了避免编译警告 */
+        return common_device_up(fd, argc, argv, cfg, subcmd);
 }
 
-void do_startkmod_usage(void)
+void do_slaver_usage()
 {
-        log_error("usage: hadmctl startkmod");
+	log_error("usage: hadmctl slaver <res_name>");
 }

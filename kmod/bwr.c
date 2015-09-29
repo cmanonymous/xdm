@@ -6,7 +6,7 @@
 #include "hadm_def.h"
 #include "hadm_struct.h"
 #include "hadm_device.h"
-#include "hadm_node.h"
+#include "hadm_site.h"
 #include "hadm_packet.h"
 #include "hadm_config.h"
 #include "hadm_bio.h"
@@ -41,27 +41,25 @@ int bwr_sector_cmp(struct bwr *bwr, sector_t s1, sector_t s2, sector_t tail)
 		return (bwr_distance(bwr, s1, tail) > bwr_distance(bwr, s2, tail)) ? -1 : 1;
 }
 
-struct bwr *bwr_alloc(size_t size, int gfp_mask)
+struct bwr *bwr_alloc(int gfp_mask)
 {
 	struct bwr *bwr;
-	int ret;
 
-	bwr = kzalloc(size, gfp_mask);
-	if (bwr == NULL) {
-		ret = -ENOMEM;
-		goto err_bwr;
+	bwr = kzalloc(sizeof(struct bwr), gfp_mask);
+	if (!bwr) {
+		pr_err("%s: alloc failed.\n", __func__);
+		return NULL;
 	}
 
 	return bwr;
-
-err_bwr:
-	return ERR_PTR(ret);
 }
 
 void free_bwr(struct bwr *bwr)
 {
 	if (bwr == NULL || IS_ERR(bwr))
 		return;
+	if (bwr->hadmdev->bwr_bdev)
+		set_device_ro(bwr->hadmdev->bwr_bdev, 0);
 	kfree(bwr);
 }
 
@@ -92,19 +90,6 @@ int __bwr_full(struct bwr *bwr)
 	return bwr->inuse_size == bwr->max_size - BWR_ALIGN_SECTOR;
 }
 
-void __bwr_dump(struct bwr *bwr)
-{
-	pr_info("hadm%d bwr inuse_size = %lu, min_disk_head = %lu, min_node_mask = %u\n",
-			bwr->hadmdev->minor,
-			bwr->inuse_size, bwr->min_disk_head, bwr->min_node_mask);
-
-	pr_info("=============hadm%d bwr mem_data===============", bwr->hadmdev->minor);
-	bwr_meta_dump(&bwr->mem_meta);
-	pr_info("=============hadm%d bwr disk_data===============", bwr->hadmdev->minor);
-	bwr_meta_dump(&bwr->disk_meta);
-}
-
-
 int bwr_full(struct bwr *bwr)
 {
 	int ret;
@@ -119,24 +104,22 @@ int bwr_full(struct bwr *bwr)
 
 void __bwr_set_inuse_size(struct bwr *bwr, sector_t size)
 {
-//	pr_info("try set inuse size from %lu to %lu.\n",
-//			bwr->inuse_size, size);
+	pr_info("try set inuse size from %lu to %lu.\n",
+			bwr->inuse_size, size);
 	if (bwr->inuse_size != size) {
 		if (unlikely(size > bwr->max_size)) {
-			pr_err("try set hadm%d bwr inuse size larger than maxsize.\n", 
-					bwr->hadmdev->minor);
+			pr_err("try set bwr inuse size larger than maxsize.\n");
 			dump_stack();
 			return;
 		}
 
 		if (size > bwr->inuse_size)
-			pr_info("warning set hadm%d bwr size increase, head:%llu(0)%llu(1), tail:%llu.\n",
-					bwr->hadmdev->minor,
+			pr_info("warning set bwr size increase, head:%llu(0)%llu(1), tail:%llu.\n",
 					bwr->disk_meta.head[0],
 					bwr->disk_meta.head[1],
 					bwr->mem_meta.tail);
 		if (__bwr_full(bwr) && !completion_done(&bwr->not_full)) {
-			pr_info("notify hadm%d bwr not full.\n", bwr->hadmdev->minor);
+			pr_info("notify bwr not full.\n");
 			complete(&bwr->not_full);
 		}
 		bwr->inuse_size = size;
@@ -146,12 +129,12 @@ void __bwr_set_inuse_size(struct bwr *bwr, sector_t size)
 int __bwr_inuse_size_dec(struct bwr *bwr)
 {
 	if (unlikely(__bwr_empty(bwr))) {
-		pr_err("BUG!! try decrease hadm%d bwr inuse size, which equals 0.\n", bwr->hadmdev->minor);
+		pr_err("BUG!! try decrease bwr inuse size, which equals 0.\n");
 		dump_stack();
 		return -1;
 	}
 	if (__bwr_full(bwr) && !completion_done(&bwr->not_full)) {
-		pr_info("notify hadm%d bwr not full.\n", bwr->hadmdev->minor);
+		pr_info("notify bwr not full.\n");
 		complete(&bwr->not_full);
 	}
 	bwr->inuse_size -= BWR_ALIGN_SECTOR;
@@ -161,31 +144,38 @@ int __bwr_inuse_size_dec(struct bwr *bwr)
 void __bwr_inuse_size_sub(struct bwr *bwr, int nr)
 {
 	if (nr <= 0) {
-		pr_info("%s: warning sub hadm%d bwr inuse size where nr <= 0 (%d).\n", 
-				__FUNCTION__, bwr->hadmdev->minor, nr);
+		pr_info("%s: warning sub bwr inuse size where nr <= 0 (%d).\n", __func__, nr);
+		return;
 	}
-	if (nr > 0 && __bwr_full(bwr) && !completion_done(&bwr->not_full)) {
-		pr_info("notify hadm%d bwr not full.\n", bwr->hadmdev->minor);
-		complete(&bwr->not_full);
+	if (nr) {
+		if (__bwr_full(bwr) && !completion_done(&bwr->not_full)) {
+			pr_info("notify bwr not full.\n");
+			complete(&bwr->not_full);
+		}
+		bwr->inuse_size -= nr * BWR_ALIGN_SECTOR;
 	}
-	bwr->inuse_size -= nr * BWR_ALIGN_SECTOR;
 }
 
 void __bwr_inuse_size_inc(struct bwr *bwr)
 {
 	if (unlikely(__bwr_full(bwr))) {
-		pr_err("BUG!! try increase hadm%d bwr inuse size, which equals max_size.\n", bwr->hadmdev->minor);
+		pr_err("BUG!! try increase bwr inuse size, which equals max_size.\n");
 		dump_stack();
 		return;
 	}
 	bwr->inuse_size += BWR_ALIGN_SECTOR;
+	/* level trigger, or edge trigger? */
+	if (bwr->inuse_size / 10 * 10 == bwr->high_water) {
+		pr_info("%s: wake up flush.\n", __func__);
+		hadm_thread_wake_up(bwr->hadmdev->threads[DBM_FLUSH_HANDLER]);
+	}
 }
 
 void __bwr_inuse_size_add(struct bwr *bwr, int nr)
 {
 	bwr->inuse_size += nr * BWR_ALIGN_SECTOR;
 	if (unlikely(bwr->inuse_size >= bwr->max_size)) {
-		pr_err("BUG!! try add hadm%d bwr inuse size, which larger max_size.\n", bwr->hadmdev->minor);
+		pr_err("BUG!! try add bwr inuse size, which larger max_size.\n");
 		dump_stack();
 		return;
 	}
@@ -193,45 +183,58 @@ void __bwr_inuse_size_add(struct bwr *bwr, int nr)
 
 int bwr_inuse_size_pre_occu(struct bwr *bwr)
 {
-	unsigned long flags;
-	struct hadm_node *runnode;
-	uint32_t min_node_mask;
+        unsigned long flags;
+	struct hadm_site *runsite;
+	uint32_t min_site_mask;
 
 try_occupy:
 	write_lock_irqsave(&bwr->lock, flags);
 	if (__bwr_full(bwr)) {
-		min_node_mask = bwr->min_node_mask;
-		write_unlock_irqrestore(&bwr->lock, flags);
-		pr_info("hadm%d bwr is full , min_node_mask=%u\n", 
-				bwr->hadmdev->minor, min_node_mask);
-		bwr_dump(bwr);
-		list_for_each_entry(runnode, &bwr->hadmdev->hadm_node_list, node) {
-			if (runnode == bwr->hadmdev->local)
+		min_site_mask = bwr->min_site_mask;
+                write_unlock_irqrestore(&bwr->lock, flags);
+		list_for_each_entry(runsite, &bwr->hadmdev->hadm_site_list, site) {
+			if (runsite == bwr->hadmdev->local_site)
 				continue;
-			if (min_node_mask & (1 << runnode->id)) {
-				pr_info("hadm%d bwr is full, try set node:%d state to inconsistent.\n", 
-						bwr->hadmdev->minor, runnode->id);
+			if (min_site_mask & (1 << runsite->id)) {
+				pr_info("bwr is full, try set site:%d state.\n", runsite->id);
 				/* BWR 满了，就应该使 delta_sync 线程退出 */
-				/* hadm_thread_stop(runnode->delta_sync); */
-				hadm_node_become_inconsitent(runnode);
+				/* hadm_thread_stop(runsite->delta_sync); */
+				hadm_site_become_inconsitent(runsite);
 			}
 		}
-		pr_info("hadm%d bwr occupy try wait.\n", bwr->hadmdev->minor);
-		if (wait_for_completion_timeout(&bwr->not_full, msecs_to_jiffies(100000)) == 0) {
-			pr_err("%s timeout, hadm%d bwr head:%llu(0)%llu(1), tail:%llu, inuse_size:%lu.\n",
-					__FUNCTION__, bwr->hadmdev->minor, bwr->mem_meta.head[0], bwr->mem_meta.head[1],
+		hadm_thread_wake_up(bwr->hadmdev->threads[DBM_FLUSH_HANDLER]);
+		(void)hadmdev_send_site_state(bwr->hadmdev);
+		pr_info("bwr occupy try wait.\n");
+		if (wait_for_completion_timeout(&bwr->not_full, msecs_to_jiffies(10000)) == 0) {
+			pr_err("%s timeout, head:%llu(0)%llu(1), tail:%llu, inuse_size:%lu.\n",
+					__func__, bwr->mem_meta.head[0], bwr->mem_meta.head[1],
 					bwr->mem_meta.tail, bwr->inuse_size);
-			bwr_dump(bwr);
-			hadmdev_set_error(bwr->hadmdev, __BWR_ERR);
+			hadmdev_set_error(bwr->hadmdev);
 			return -1;
+//			if ((hadm_thread_get_state(bio_handler)) != HADM_THREAD_RUN) {
+//				return -1;
+//			}
 		}
 		goto try_occupy;
 	}
 
 	/* FIXME need guarantee bwr->disk_meta->min_head after this area. */
 	__bwr_inuse_size_inc(bwr);
+//	pr_info("pre occu:inuse_size:%lu|max_size:%lu.\n",
+//			bwr->inuse_size,
+//			bwr->max_size);
 	write_unlock_irqrestore(&bwr->lock, flags);
 	return 0;
+}
+
+int bwr_low_water(struct bwr *bwr)
+{
+	return bwr->inuse_size < bwr->low_water;
+}
+
+int bwr_high_water(struct bwr *bwr)
+{
+	return bwr->inuse_size > bwr->high_water;
 }
 
 sector_t bwr_get_inuse_size(struct bwr *bwr)
@@ -246,35 +249,21 @@ sector_t bwr_get_inuse_size(struct bwr *bwr)
 	return size;
 }
 
+/* FIXME: update? */
 void bwr_update_inuse_size(struct bwr *bwr)
 {
 	unsigned long flags;
-	uint32_t node_mask;
+	uint32_t site_mask;
 	sector_t min_head, delta;
-	write_lock_irqsave(&bwr->lock, flags);
-	min_head = __bwr_get_min_head(bwr, &node_mask);
-	if (min_head != bwr->min_disk_head) {
-		bwr->min_node_mask = node_mask;
-		if(bwr->min_disk_head != INVALID_SECTOR) {
-			delta = bwr_distance(bwr, bwr->min_disk_head, min_head);
-			if(bwr->inuse_size < delta ){
-				pr_warn("%s: hadm%d inuse size over flow, inuse_size = %lu, sub = %lu, min_head = %lu, bwr->min_disk_head = %lu.\n",
-						__FUNCTION__, bwr->hadmdev->minor, 
-						bwr->inuse_size, delta,
-						min_head, bwr->min_disk_head);
-				__bwr_dump(bwr);
-				write_unlock_irqrestore(&bwr->lock, flags);
-				//BUG();
-				hadmdev_set_error(bwr->hadmdev, __BWR_ERR);
-				return;
-			}else {
-				__bwr_inuse_size_sub(bwr, delta / BWR_ALIGN_SECTOR);
-			}
-		}else {
-			delta = bwr_distance(bwr, min_head, bwr->disk_meta.tail);
-			__bwr_set_inuse_size(bwr, delta);
 
-		}
+	/* Note: 未加锁，目前该函数在仅sync_bwr_meta()中调用，disk_head的修改非并发*/
+	min_head = __bwr_get_min_head(bwr, &site_mask);
+	write_lock_irqsave(&bwr->lock, flags);
+	if (min_head != bwr->min_disk_head) {
+		bwr->min_site_mask = site_mask;
+		delta = bwr_distance(bwr, bwr->min_disk_head, min_head);
+		__bwr_inuse_size_sub(bwr, delta / BWR_ALIGN_SECTOR);
+		//__bwr_set_inuse_size(bwr, inuse_size);
 		bwr->min_disk_head = min_head;
 	}
 	write_unlock_irqrestore(&bwr->lock, flags);
@@ -290,32 +279,15 @@ sector_t bwr_next_sector(struct bwr * bwr, sector_t sector)
 	return bwr_next_nr_sector(bwr, sector, 1);
 }
 
-sector_t bwr_lastpi_seq(struct bwr *bwr)
-{
-	unsigned long flags;
-	sector_t seq;
-
-	read_lock_irqsave(&bwr->lock, flags);
-	seq = bwr->mem_meta.last_primary.bwr_seq;
-	read_unlock_irqrestore(&bwr->lock, flags);
-
-	return seq;
-}
-
 sector_t bwr_seq(struct bwr *bwr)
 {
 	unsigned long flags;
 	sector_t seq;
 
 	read_lock_irqsave(&bwr->lock, flags);
-	if(bwr->mem_meta.local_primary.id != INVALID_ID) {
-		seq = bwr->mem_meta.local_primary.bwr_seq;
-	}else if(bwr->mem_meta.last_primary.id != INVALID_ID) {
-		seq = bwr->mem_meta.last_primary.bwr_seq;
-	}else{
-		return 0;
-	}
+	seq = bwr->mem_meta.local_primary.bwr_seq;
 	read_unlock_irqrestore(&bwr->lock, flags);
+
 	return seq;
 }
 
@@ -325,13 +297,12 @@ sector_t bwr_seq_add(struct bwr * bwr, sector_t sector)
 	sector_t seq;
 
 	write_lock_irqsave(&bwr->lock, flags);
-	seq = bwr->mem_meta.local_primary.bwr_seq;
+        seq = bwr->mem_meta.local_primary.bwr_seq;
 	bwr->mem_meta.local_primary.bwr_seq += sector;
 	write_unlock_irqrestore(&bwr->lock, flags);
 
 	return seq;
 }
-
 
 sector_t bwr_disk_tail(struct bwr *bwr)
 {
@@ -355,16 +326,6 @@ sector_t bwr_tail(struct bwr * bwr)
 	read_unlock_irqrestore(&bwr->lock, flags);
 
 	return tail;
-}
-
-int valid_bwr_sector(struct bwr *bwr, int node_id, sector_t sector)
-{
-	int ret = 0;
-	unsigned long flags;
-	read_lock_irqsave(&bwr->lock, flags);
-	ret = (sector == bwr->mem_meta.tail) ? 0 : sector_in_area(sector, bwr->mem_meta.head[node_id], bwr->mem_meta.tail) ;
-	read_unlock_irqrestore(&bwr->lock, flags);
-	return ret;
 }
 
 static void __bwr_tail_add_sector(struct bwr * bwr, sector_t sector)
@@ -410,39 +371,19 @@ void bwr_tail_inc_occupied(struct bwr *bwr)
 	write_unlock_irqrestore(&bwr->lock, flags);
 }
 
-uint64_t bwr_add_seq_n_tail(struct bwr * bwr, sector_t sector)
-{
-	unsigned long flags;
-	uint64_t bwr_seq;
 
-	write_lock_irqsave(&bwr->lock, flags);
-	if(bwr->mem_meta.local_primary.id != INVALID_ID) {
-		bwr->mem_meta.local_primary.bwr_seq += sector;
-		bwr_seq = bwr->mem_meta.local_primary.bwr_seq;
-	}else {
-		bwr->mem_meta.last_primary.bwr_seq += sector;
-		bwr_seq = bwr->mem_meta.last_primary.bwr_seq;
-	}
-	__bwr_tail_add_sector(bwr, sector * BWR_ALIGN_SECTOR);
-	write_unlock_irqrestore(&bwr->lock, flags);
-	return bwr_seq;
-
-}
-
-
-
-int bwr_node_head_cmp(struct bwr *bwr, uint8_t node1,uint8_t node2)
+int bwr_site_head_cmp(struct bwr *bwr, uint8_t site1,uint8_t site2)
 {
 	int ret=0;
 	unsigned long flags;
 
-	BUG_ON(!VALID_NODE(node1) || !VALID_NODE(node2));
+	BUG_ON(!VALID_SITE(site1) || !VALID_SITE(site2));
 
 	read_lock_irqsave(&bwr->lock, flags);
 	ret = bwr_sector_cmp(bwr,
-			bwr->mem_meta.head[node1],
-			bwr->mem_meta.head[node2],
-			bwr->mem_meta.tail);
+			     bwr->mem_meta.head[site1],
+			     bwr->mem_meta.head[site2],
+			     bwr->mem_meta.tail);
 	read_unlock_irqrestore(&bwr->lock, flags);
 
 	return ret;
@@ -453,32 +394,17 @@ int bwr_sector_less(struct bwr *bwr, sector_t s1, sector_t s2, sector_t tail)
 	return bwr_sector_cmp(bwr, s1, s2, tail) < 0;
 }
 
-sector_t __bwr_get_min_head(struct bwr *bwr, uint32_t *node_map)
+sector_t __bwr_get_min_head(struct bwr *bwr, uint32_t *site_map)
 {
 	sector_t min_head = INVALID_SECTOR;
 	int i = 0, result;
 	uint32_t map = 0;
-	int local_node_id = get_node_id();
-	/**
-	 * 对于secondary节点的写操作，因为只有local head，所以
-	 * 也比较local head
-	 **/
-
-	if(bwr->mem_meta.local_primary.id == INVALID_ID) {
-		min_head = bwr->disk_meta.head[local_node_id] ;
-		*node_map = 1 << local_node_id;
-		return min_head;
-	}
 
 	for (i = 0; i < MAX_NODES; i++) {
-		if (i == local_node_id) {
-			continue;
-		}
-
 		if (bwr->disk_meta.head[i] != INVALID_SECTOR) {
 			result = bwr_sector_cmp(bwr,
-					min_head, bwr->disk_meta.head[i],
-					bwr->disk_meta.tail);
+						min_head, bwr->disk_meta.head[i],
+						bwr->disk_meta.tail);
 			switch (result) {
 			case 1:
 				min_head = bwr->disk_meta.head[i];
@@ -493,14 +419,12 @@ sector_t __bwr_get_min_head(struct bwr *bwr, uint32_t *node_map)
 		}
 	}
 
-	if (node_map != NULL)
-		*node_map = map;
-	//pr_info("%s: get min_head=%lu, min_node_mask=%u\n", __FUNCTION__, min_head, map);
-
+	if (site_map != NULL)
+		*site_map = map;
 	return min_head;
 }
 
-uint64_t bwr_get_uuid(struct bwr *bwr)
+uint64_t bwr_uuid(struct bwr *bwr)
 {
 	uint64_t uuid = 0;
 	unsigned long flags;
@@ -511,122 +435,98 @@ uint64_t bwr_get_uuid(struct bwr *bwr)
 	return uuid;
 }
 
-uint64_t __bwr_node_head_inc(struct bwr *bwr, int node_id)
+void __bwr_site_head_inc(struct bwr *bwr, int site_id)
 {
-	return (bwr->mem_meta.head[node_id] = bwr_next_sector(bwr, bwr->mem_meta.head[node_id]));
-	//if (bwr->min_node_mask & (1 << node_id))
-	//__bwr_clear_min_node(bwr, node_id);
+	bwr->mem_meta.head[site_id] = bwr_next_sector(bwr, bwr->mem_meta.head[site_id]);
+	//if (bwr->min_site_mask & (1 << site_id))
+		//__bwr_clear_min_site(bwr, site_id);
 }
 
-void __bwr_node_head_add(struct bwr *bwr, int node_id, int nr)
+void __bwr_site_head_add(struct bwr *bwr, int site_id, int nr)
 {
-	bwr->mem_meta.head[node_id] = bwr_next_nr_sector(bwr, bwr->mem_meta.head[node_id], nr);
-	//if (bwr->min_node_mask & (1 << node_id))
-	//__bwr_clear_min_node(bwr, node_id);
+	bwr->mem_meta.head[site_id] = bwr_next_nr_sector(bwr, bwr->mem_meta.head[site_id], nr);
+	//if (bwr->min_site_mask & (1 << site_id))
+		//__bwr_clear_min_site(bwr, site_id);
 }
 
-uint64_t bwr_node_head_inc(struct bwr *bwr, int node_id)
-{
-	unsigned long flags;
-	uint64_t ret = 0 ;
-
-	write_lock_irqsave(&bwr->lock, flags);
-	ret = __bwr_node_head_inc(bwr, node_id);
-	write_unlock_irqrestore(&bwr->lock, flags);
-	return ret;
-}
-
-void bwr_node_head_condition_inc(struct bwr *bwr, int node_id, uint64_t expect_head)
+void bwr_site_head_inc(struct bwr *bwr, int site_id)
 {
 	unsigned long flags;
 
 	write_lock_irqsave(&bwr->lock, flags);
-	if(bwr->mem_meta.head[node_id] == expect_head)
-		__bwr_node_head_inc(bwr, node_id);
+	__bwr_site_head_inc(bwr, site_id);
 	write_unlock_irqrestore(&bwr->lock, flags);
 }
 
-void bwr_node_head_add(struct bwr *bwr, int node_id, int nr)
+void bwr_site_head_add(struct bwr *bwr, int site_id, int nr)
 {
+	unsigned long flags;
+
 	BUG_ON(nr < 0);
 	if (!nr)
 		return;
-	write_lock(&bwr->lock);
-	__bwr_node_head_add(bwr, node_id, nr);
-	write_unlock(&bwr->lock);
+	write_lock_irqsave(&bwr->lock, flags);
+	__bwr_site_head_add(bwr, site_id, nr);
+	write_unlock_irqrestore(&bwr->lock, flags);
 }
 
-void __bwr_set_node_head(struct bwr *bwr, int node_id, sector_t head)
+void __bwr_set_site_head(struct bwr *bwr, int site_id, sector_t head)
 {
-	bwr->mem_meta.head[node_id]  =  head;
+	bwr->mem_meta.head[site_id] = head;
 #if 0
 	sector_t min_head, orig_head, distance;
-	//pr_info("%s for node %d from %llu to %lu.\n", __FUNCTION__,
-	//node_id, bwr->mem_meta.head[node_id], head);
-	if (bwr->mem_meta.head[node_id] != head){
-		orig_head = bwr->mem_meta.head[node_id];
-		bwr->mem_meta.head[node_id] = head;
-		if (bwr->min_node_mask & (1 << node_id)) {
-			pr_info("node %d is in min_node_mask %u, clear it.\n",
-					node_id, bwr->min_node_mask);
-			bwr->min_node_mask &= ~((uint32_t)1 << node_id);
-			if (!bwr->min_node_mask) {
-				min_head = __bwr_get_min_head(bwr, &bwr->min_node_mask);
+	//pr_info("%s for site %d from %llu to %lu.\n", __func__,
+			//site_id, bwr->mem_meta.head[site_id], head);
+	if (bwr->mem_meta.head[site_id] != head){
+		orig_head = bwr->mem_meta.head[site_id];
+		bwr->mem_meta.head[site_id] = head;
+		if (bwr->min_site_mask & (1 << site_id)) {
+			pr_info("site %d is in min_site_mask %u, clear it.\n",
+					site_id, bwr->min_site_mask);
+			bwr->min_site_mask &= ~((uint32_t)1 << site_id);
+			if (!bwr->min_site_mask) {
+				min_head = __bwr_get_min_head(bwr, &bwr->min_site_mask);
 				distance = bwr_distance(bwr, orig_head, min_head);
 				__bwr_inuse_size_sub(bwr, distance/BWR_ALIGN_SECTOR);
 			}
 		}
-		bwr->mem_meta.head[node_id] = head;
+		bwr->mem_meta.head[site_id] = head;
 	}
 #endif
 }
 
-void bwr_set_node_head(struct bwr *bwr, int node_id, sector_t head, int lock_node_state)
+void bwr_set_site_head(struct bwr *bwr, int site_id, sector_t head)
 {
-	unsigned long flags, flags2;
-	struct hadm_node *node = find_hadm_node_by_id(bwr->hadmdev, node_id);
-	if(node == NULL){
-		return ;
-	}
+	unsigned long flags;
+
 	write_lock_irqsave(&bwr->lock, flags);
-	__bwr_set_node_head(bwr, node_id, head);
-	if(lock_node_state)
-		spin_lock_irqsave(&node->s_state.lock, flags2);
-	node->s_state.snd_head = node->s_state.snd_ack_head = head;
-	if(lock_node_state)
-		spin_unlock_irqrestore(&node->s_state.lock, flags2);
+	__bwr_set_site_head(bwr, site_id, head);
 	write_unlock_irqrestore(&bwr->lock, flags);
 }
 
-sector_t bwr_node_head(struct bwr *bwr, int node_id)
+sector_t bwr_site_head(struct bwr *bwr, int site_id)
 {
-	sector_t node_head;
+	sector_t site_head;
 	unsigned long flags;
 
 	read_lock_irqsave(&bwr->lock, flags);
-	node_head = __bwr_node_head(bwr, node_id);
+	site_head = __bwr_site_head(bwr, site_id);
 	read_unlock_irqrestore(&bwr->lock, flags);
 
-	return node_head;
+	return site_head;
 }
 
 /* Note: caller gurantee C_STATE == C_SYNC */
-int is_uptodate(struct bwr *bwr ,int node_id)
+int is_uptodate(struct bwr *bwr ,int site_id)
 {
 	unsigned long flags;
 	int ret=0;
 
 	read_lock_irqsave(&bwr->lock, flags);
-	ret = bwr->mem_meta.head[node_id] == bwr->mem_meta.tail;
+	ret = bwr->mem_meta.head[site_id] == bwr->mem_meta.tail;
 	read_unlock_irqrestore(&bwr->lock, flags);
 
 	return ret;
-}
-
-static uint64_t pack_node_seq(struct list_head *q_node)
-{
-	struct hadm_pack_node *node = list_entry(q_node, struct hadm_pack_node, q_node);
-	return node->pack->bwr_seq;
 }
 
 /*
@@ -635,172 +535,177 @@ static uint64_t pack_node_seq(struct list_head *q_node)
  * 如果是第二次进入这个函数，那么就会发生设置磁盘状态为 D_CONSISTENT 的时机拖后，
  * 现在的处理是接受这种状态。
  */
-int delta_sync_bwr(struct hadm_node *node, sector_t start, sector_t end)
+int delta_sync_bwr(struct hadm_site *site, sector_t start, sector_t end)
 {
 	struct bwr_data *bwr_data;
-	struct bwr *bwr = node->hadmdev->bwr;
-	struct hadm_queue *delta_packet_queue = node->dbm->dbm_sync_param->delta_packet_queue;
+	struct bwr *bwr = site->hadmdev->bwr;
 	int cstate, ret = 0;
-	sector_t last_seq = 0 , start_seq = 0;
-	uint32_t un_acked = 0 ;
-	uint32_t npack = bwr_distance(bwr, start, end)/BWR_ALIGN_SECTOR;
-	uint32_t completed = 0 ;
-	int work = 0 ;
-	int percent, last_percent = 0;
-	unsigned long start_jif = jiffies;
-	pr_info("start delta sync hadm%d bwr from sector %lu to %lu, %d blocks should be synced\n",
-			bwr->hadmdev->minor, 
-			start, end, npack);
 
-	while (npack || un_acked) {
-		if (hadm_thread_get_state(node->delta_sync) != HADM_THREAD_RUN) {
+	cstate = hadm_site_get(site, SECONDARY_STATE, S_CSTATE);
+	if (cstate != C_DELTA_SYNC_BWR)
+		return -EKMOD_BAD_CSTATE;
+
+	while (start != end) {
+		if (hadm_thread_get_state(site->delta_sync) == HADM_THREAD_EXIT) {
 			ret = -EKMOD_DELTA_SYNC_EXIT;
 			goto done;
 		}
 
-		cstate = hadm_node_get(node, SECONDARY_STATE, S_CSTATE);
+		cstate = hadm_site_get(site, SECONDARY_STATE, S_CSTATE);
 		if (cstate != C_DELTA_SYNC_BWR) {
-			pr_info ("%s: hadm%d cstate is not C_DELTA_SYNC_BWR, its real cstate=%d\n",
-					__FUNCTION__, bwr->hadmdev->minor, cstate);
+			pr_info ("%s: cstate is not C_DELTA_SYNC_BWR, its real cstate=%d\n",
+				 __func__, cstate);
 			ret = -EKMOD_BAD_CSTATE;
 			break;
 		}
-		work = 0 ;
-		if(un_acked < hadm_queue_free_space(delta_packet_queue) && npack) {
 
-			bwr_data = get_send_head_data(bwr, node->id, last_seq);
-			if (bwr_data == NULL) {
-				pr_err("%s: get hadm%d BWR data failed\n", __FUNCTION__, bwr->hadmdev->minor);
-				ret = -EKMOD_UNKNOWN_STATE;
-				goto done;
-			}
-			last_seq = bwr_data->meta.bwr_seq;
-			if(start_seq == 0){
-				start_seq = last_seq;
-			}
-			ret = sync_node_bwrdata(node, bwr_data, P_RS_DATA);
-			//pr_info("%s: send bwr data  bwr_seq = %llu\n", __FUNCTION__, bwr_data->meta.bwr_seq);
-			bwr_data_put(bwr_data);
-			if (ret < 0) {
-				pr_err("%s sync hadm%d bwrdata faild.\n", __FUNCTION__, bwr->hadmdev->minor);
-				goto done;
-			}
-			un_acked ++;
-			npack -- ;
-			work ++;
-
-			snd_head_condition_update(node, S_CSTATE, C_DELTA_SYNC_BWR);
-			start = bwr_next_sector(bwr, start);
+		bwr_data = get_send_head_data(bwr, site->id);
+		if (bwr_data == NULL) {
+			pr_err("%s: get BWR data failed\n", __func__);
+			ret = -EKMOD_UNKNOWN_STATE;
+			goto done;
 		}
-		for(; un_acked ;){
-			struct hadm_pack_node *pnode = NULL;
-			struct list_head *q_node = hadm_queue_pop_in_seq_timeout(delta_packet_queue, pack_node_seq, start_seq, 1000);
-			if(q_node == NULL)
-				break;
-			pnode = list_entry(q_node, struct hadm_pack_node, q_node);
-			hadm_pack_node_free(pnode);
-			bwr_node_head_inc(bwr, node->id);
-			start_seq ++;
-			un_acked --;
-			completed ++;
-			work ++;
-		}
-		if(!work){
-			schedule();
-		}
-		percent = 100 * completed / (npack + un_acked + completed);
-		if( percent - last_percent >= 10){
-			pr_info("%s: hadm%d pack remained = %d, unacked = %d, completed = %d%%, sync rate = %u KBytes/Sec\n",
-					__FUNCTION__, bwr->hadmdev->minor, npack, un_acked, percent,
-					completed *4 *1000/jiffies_to_msecs(jiffies - start_jif));
-			last_percent = percent;
+		ret = sync_site_bwrdata(site, bwr_data, P_SD_RSDATA);
+		bwr_data_put(bwr_data);
+		if (ret < 0) {
+			pr_err("%s sync bwrdata faild.\n", __func__);
+			goto done;
 		}
 
+		snd_head_condition_update(site, S_CSTATE, C_DELTA_SYNC_BWR);
+		start += BWR_ALIGN_SECTOR;
+	}
+
+	/* 等待 sync 完成 */
+	while (!ret) {
+		sector_t head = bwr_site_head(bwr, site->id);
+		pr_info("delta_sync_bwr: head=%llu, end=%llu\n",
+			(unsigned long long)head, (unsigned long long)end);
+		if (head == end)
+			break;
+		if (hadm_thread_get_state(site->delta_sync) == HADM_THREAD_EXIT) {
+			ret = -EKMOD_DELTA_SYNC_EXIT;
+			goto done;
+		}
+		cstate = hadm_site_get(site, SECONDARY_STATE, S_CSTATE);
+		if (cstate != C_DELTA_SYNC_BWR) {
+			ret = 0;
+			break;
+		}
+		msleep(1000);
 	}
 
 done:
 	return ret;
 }
 
+struct async_bwr_meta_data {
+	struct page *meta_page;
+	struct bwr *bwr;
+};
 
-
-int sync_disk_meta(struct bwr *bwr)
+void async_bwr_meta_endio(void *data)
 {
-	struct bwr_disk_info *disk_info;
+	struct async_bwr_meta_data *meta_data = data;
+	struct bwr *bwr = meta_data->bwr;
+	struct page *meta_page = meta_data->meta_page;
+	struct bwr_disk_info *disk_info = page_address(meta_page);
+
+	bwr->disk_meta = disk_info->meta;
+	bwr_update_inuse_size(bwr);
+
+	kfree(data);
+	__free_page(meta_page);
+}
+
+int async_bwr_meta(struct bwr *bwr)
+{
 	int ret = 0;
 	unsigned long flags;
-	int updated = 0;
+	struct page *meta_page;
+	struct bwr_disk_info *disk_info;
+	struct async_bwr_meta_data *data;
+	struct hadm_io iov;
 
-	disk_info = kzalloc(sizeof(struct bwr_disk_info), GFP_KERNEL);
-	if (disk_info == NULL) {
-		pr_err("%s: no memory\n", __FUNCTION__);
+	data = kmalloc(GFP_KERNEL, sizeof(struct async_bwr_meta_data));
+	if (!data) {
 		ret = -ENOMEM;
 		goto done;
 	}
-	wait_for_completion(&bwr->wait);	/* 不是等待，而是获取资源 */
+	data->bwr = bwr;
+
+	meta_page = alloc_page(GFP_KERNEL);
+	if (!meta_page) {
+		ret = -ENOMEM;
+		kfree(data);
+		goto done;
+	}
+	disk_info = page_address(meta_page);
+	data->meta_page = meta_page;
+
 	read_lock_irqsave(&bwr->lock, flags);
-	if(bwr->mem_meta.local_primary.id != INVALID_ID ||
-			bwr->mem_meta.last_primary.id != INVALID_ID) {
-		/**
-		 *在把meta写入磁盘时，检测meta是否合法，包括bwr_seq 和tail是否对应
-		 */
-		if(unlikely(valid_bwr_meta(bwr))) {
-			pr_info("%d bwr meta invalid.\n", bwr->hadmdev->minor);
-			bwr_dump(bwr);
-			read_unlock_irqrestore(&bwr->lock, flags);
-			hadmdev_set_error(bwr->hadmdev, __BWR_ERR);
-			return -EINVAL;
-		}
-
-	}
-
-	if(memcmp(&bwr->mem_meta, &bwr->disk_meta, sizeof(struct bwr_meta)) != 0) {
-		updated = 1;
-		memcpy(&disk_info->meta, &bwr->mem_meta, sizeof(struct bwr_meta));
-	}
+	disk_info->meta = bwr->mem_meta;
 	read_unlock_irqrestore(&bwr->lock, flags);
-	if(!updated){
-		goto done;
-	}
-	/* NOTE: 写入磁盘失败了怎么办？ */
-	ret = hadm_bio_write_sync(bwr->hadmdev->bwr_bdev,
-			bwr->disk_meta.meta_start,
-			(char *)disk_info,
-			sizeof(struct bwr_disk_info));
-	if (ret ) {
-		pr_err("%s: hadm%d write disk failed: want=%d, write=%d\n",
-				__FUNCTION__, bwr->hadmdev->minor, (int)sizeof(struct bwr_disk_info), ret);
-		ret = -EIO;
-		goto done;
-	}
-	/**TODO: 锁的实现需要调整**/
-	write_lock_irqsave(&bwr->lock, flags);
-	memcpy(&bwr->disk_meta, &disk_info->meta, sizeof(struct bwr_meta));
-	write_unlock_irqrestore(&bwr->lock, flags);
-	//bwr_dump(bwr);
-	bwr_update_inuse_size(bwr);
+
+	iov.page = meta_page;
+	iov.start = 0;
+	iov.len = PAGE_SIZE;
+
+	return abi_add(&bwr->abi, bwr->hadmdev->bwr_bdev,
+			bwr->disk_meta.meta_start, &iov, 1,
+			async_bwr_meta_endio, data);
 done:
-	kfree(disk_info);
-	complete(&bwr->wait);	/* 释放资源 */
 	return ret;
 }
 
+int sync_bwr_meta(struct bwr *bwr)
+{
+	int ret = 0;
+	unsigned long flags;
+	struct page *meta_page;
+	struct bwr_disk_info *disk_info;
+
+	meta_page = alloc_page(GFP_KERNEL);
+	if (!meta_page) {
+		ret = -ENOMEM;
+		goto done;
+	}
+	disk_info = page_address(meta_page);
+
+	wait_for_completion(&bwr->wait);	/* 不是等待，而是获取资源 */
+	read_lock_irqsave(&bwr->lock, flags);
+	disk_info->meta = bwr->mem_meta;
+	read_unlock_irqrestore(&bwr->lock, flags);
+
+	/* NOTE: 写入磁盘失败了怎么办？ */
+	ret = hadm_write_page_sync(bwr->hadmdev->bwr_bdev, bwr->disk_meta.meta_start,
+			meta_page, PAGE_SIZE);
+	if (ret < 0) {
+		pr_err("%s: sync meta failed.\n", __func__);
+		ret = -EIO;
+		goto free_page;
+	}
+
+	bwr->disk_meta = disk_info->meta;
+	bwr_update_inuse_size(bwr);
+
+free_page:
+	__free_page(meta_page);
+	complete(&bwr->wait);	/* 释放资源 */
+done:
+	return ret;
+}
+
+
 int update_bwr_meta(struct bwr *bwr, int which,
-		int dstate, uint64_t tail,
-		uint32_t node_id, uint64_t uuid, uint64_t seq,
-		uint64_t dev_sector, uint8_t md5[])
+		   int dstate, uint64_t tail,
+		   uint32_t site_id, uint64_t uuid, uint64_t seq,
+		   uint64_t dev_sector, uint8_t md5[])
 {
 	int i;
+	int ret = 0;
 	unsigned long flags;
-	uint64_t bwr_seq = 0;
-	/**
-	 *当节点从secondary变成primary，或者从primary端从delta_sync
-	 *到bwr_sync之间切换的话，需要将bwr里的head、dbm 信息reset
-	 *对于前者，当local_primary.id从INVALID_ID到node_id时，reset_bwr =1
-	 *对于后者，当d_state发生变化时，reset_bwr=1
-	 *?是不是只有这两种情况需要reset_bwr?
-	 */
-	int reset_bwr = 0 ;
+
 	write_lock_irqsave(&bwr->lock, flags);
 	if (which == UPDATE_BWR_META) {
 		/* nothing, just write mem_meta to disk */ ;
@@ -808,203 +713,116 @@ int update_bwr_meta(struct bwr *bwr, int which,
 		bwr->mem_meta.tail = tail;
 		bwr->mem_meta.local_primary.bwr_seq += 1;
 	} else if (which == LOCAL_PRIMARY) {
-		if(bwr->mem_meta.local_primary.id == INVALID_ID){
-			reset_bwr = 1;
-		}
-
-
-		bwr->mem_meta.local_primary.id = node_id;
+		bwr->mem_meta.local_primary.id = site_id;
 		if (bwr->mem_meta.local_primary.uuid == 0)
 			bwr->mem_meta.local_primary.uuid = uuid;
 		if (bwr->mem_meta.local_primary.bwr_seq == 0)
 			bwr->mem_meta.local_primary.bwr_seq = 1;
-		bwr_seq = bwr->mem_meta.local_primary.bwr_seq;
 	} else if (which == LAST_PRIMARY) {
-		if(bwr->mem_meta.disk_state != dstate ||
-				(bwr->mem_meta.last_primary.bwr_seq && !seq) ||
-				(!bwr->mem_meta.last_primary.bwr_seq && seq)) {
-			reset_bwr = 1;
-		}
 		bwr->mem_meta.disk_state = dstate;
-		hadm_node_set(bwr->hadmdev->local, SECONDARY_STATE, S_DSTATE, dstate);
-		bwr->mem_meta.last_primary.id = node_id;
+		bwr->mem_meta.last_primary.id = site_id;
 		bwr->mem_meta.last_primary.uuid = uuid;
+		bwr->mem_meta.last_primary.bwr_seq = seq;
 		bwr->mem_meta.local_primary.id = INVALID_ID;
 		bwr->mem_meta.local_primary.uuid = 0;
 		bwr->mem_meta.local_primary.bwr_seq = 0;
 		bwr->mem_meta.last_primary.last_page_damaged = 0;
 		if (bwr->mem_meta.disk_state == D_CONSISTENT) {
-			bwr->mem_meta.last_primary.bwr_seq = seq;
 			bwr->mem_meta.last_primary.last_page = dev_sector;
 			for (i = 0; i < 16; i++)
 				bwr->mem_meta.last_primary.last_page_md5[i] = md5[i];
-		}else {
-			bwr->mem_meta.last_primary.bwr_seq = 0;
-
 		}
-		bwr_seq = bwr->mem_meta.last_primary.bwr_seq;
+	} else {
+		pr_err("%s: invalid write mode\n", __func__);
+		ret = -EINVAL;
 	}
-	/**
-	 *在reset bwr的时候，将修改内存状态和同步到磁盘相分离。
-	 */
+
 	write_unlock_irqrestore(&bwr->lock, flags);
-	if(reset_bwr) {
-		struct hadm_node *hadm_node;
-		unsigned long flags;
-		pr_info("%s: reset hadm%d bwr, bwr_seq = %llu\n", __FUNCTION__, bwr->hadmdev->minor, bwr_seq);
-		write_lock_irqsave(&bwr->lock, flags);
-		bwr->last_seq = 0;
-		bwr->mem_meta.tail = seq_to_bwr(bwr_seq + 1, bwr);
-        	bwr->min_disk_head = INVALID_SECTOR;
-		list_for_each_entry(hadm_node, &bwr->hadmdev->hadm_node_list, node) {
-			if(which == LOCAL_PRIMARY || hadm_node->id == get_node_id() ) {
-				bwr->mem_meta.head[hadm_node->id] = bwr->mem_meta.tail;
-			}else {
-				bwr->mem_meta.head[hadm_node->id] = bwr->mem_meta.tail;
-			}
-		}
-		write_unlock_irqrestore(&bwr->lock, flags);
-
-		list_for_each_entry(hadm_node, &bwr->hadmdev->hadm_node_list, node)
-			hadm_node_reset_send_head(hadm_node);
-
-		//bwr->min_disk_head = bwr->mem_meta.tail;
-		clear_data_buffer(bwr->hadmdev->buffer);
-		bwr_meta_dump(&bwr->mem_meta);
-	}
-
-	/**
-	if (which == LAST_PRIMARY) {
-		if (bwr->disk_meta.local_primary.id != INVALID_ID) {
-			bwr_reset(bwr, 0);
-			clear_data_buffer(bwr->hadmdev->buffer);
-		}
-	}**/
-	return reset_bwr;
-}
-
-void set_last_primary(struct bwr *bwr, uint32_t node_id, uint64_t uuid)
-{
-	unsigned long flags;
-	struct hadm_node *hadm_node;
-	int local_node_id = get_node_id();
-	write_lock_irqsave(&bwr->lock, flags);
-	if(bwr->mem_meta.local_primary.id != INVALID_ID){
-		bwr->mem_meta.local_primary.id = INVALID_ID;
-		bwr->mem_meta.local_primary.uuid = 0 ;
-		bwr->mem_meta.local_primary.bwr_seq = 0 ;
-
-	}
-	if(bwr->mem_meta.last_primary.id != node_id ||
-			bwr->mem_meta.last_primary.uuid != uuid) {
-		bwr->mem_meta.last_primary.id = node_id;
-		bwr->mem_meta.last_primary.uuid = uuid;
-		if(bwr->mem_meta.disk_state == D_CONSISTENT) {
-			bwr->mem_meta.last_primary.bwr_seq = 1;
-		}else {
-			bwr->mem_meta.last_primary.bwr_seq = 0 ;
-		}
-		/**
-		 *当节点从primary变成secondary或者更改primary，需要重新设置
-		 *head
-		 */
-	}
-	/**
-	 *当secondary曾经变成primary，这时候head信息会被修改，但是再次握手时，
-	 *bwr_seq=1会被认为是没有数据，所以依然握手成功，但是此时last_primary的
-	 *bwr_seq > 1 ，从而会在保存数据时认为bwr非法
-	 */
-	list_for_each_entry(hadm_node, &bwr->hadmdev->hadm_node_list, node) {
-		bwr->mem_meta.head[hadm_node->id] = -1;
-	}
-	bwr->min_disk_head =
-		bwr->mem_meta.head[local_node_id] =
-		bwr->mem_meta.tail = seq_to_bwr(bwr->mem_meta.last_primary.bwr_seq + 1, bwr);
-	/**
-	 *当和primary重新连接时，需要清除掉buffer里的内容，
-	 *比如在多个节点primary变化时，seq也会跟着变化，这时候如果不清除buffer，
-	 *会导致io sequence 校验出错
-	 */
-	clear_data_buffer(bwr->hadmdev->buffer);
-
-	pr_info("%s: set hadm%d node %d as my last primary, uuid = %llu, bwr_seq = %llu\n",
-			__FUNCTION__, bwr->hadmdev->minor, 
-			bwr->mem_meta.last_primary.id,
-			bwr->mem_meta.last_primary.uuid,
-			bwr->mem_meta.last_primary.bwr_seq);
-	write_unlock_irqrestore(&bwr->lock, flags);
-
-}
-int write_bwr_meta(struct bwr *bwr, int which,
-		int dstate, uint64_t tail,
-		uint32_t node_id, uint64_t uuid, uint64_t seq,
-		uint64_t dev_sector, uint8_t md5[])
-{
-	int reset_bwr = 0;
-	reset_bwr = update_bwr_meta(bwr, which, dstate, tail, node_id,
-			uuid, seq, dev_sector, md5);
-	if(reset_bwr) {
-		reset_dbm(bwr->hadmdev);
-	}
-	return sync_disk_meta(bwr);
-}
-
-static int bwr_init_data_list(struct bwr *bwr)
-{
-	struct bwr_data_block *block;
-	struct bwr_data *bwr_data;
-	uint64_t offset;
-	struct page *page;
-	int ret = 0, local_node_id;
-	struct data_buffer *buffer = bwr->hadmdev->buffer;
-
-	if (bwr->disk_meta.local_primary.id == INVALID_ID)
-		return 0;
-	pr_info("try load hadm%d unfinished local data.\n", bwr->hadmdev->minor);
-	local_node_id = get_node_id();
-	block = kzalloc(sizeof(struct bwr_data_block), GFP_KERNEL);
-	for (offset = bwr->disk_meta.head[local_node_id];
-			offset != bwr->disk_meta.tail;
-			offset = bwr_next_sector(bwr, offset)) {
-		hadm_read_bwr_block(bwr->hadmdev->bwr_bdev,offset,(char *)block,sizeof(struct bwr_data_block));
-		if (offset != block->meta.bwr_sector) {
-			pr_err("%s: offset(%lu) not equal to hadm%d block bwr sector (%lu)\n",
-					__FUNCTION__, (unsigned long)offset, bwr->hadmdev->minor, 
-					(unsigned long)block->meta.bwr_sector);
-			ret = -1;
-			goto done;
-		}
-
-		page = alloc_page(GFP_KERNEL);
-		if (!page) {
-			ret = -1;
-			goto done;
-		}
-		bwr_data = init_bwr_data(offset, block->meta.dev_sector,
-				block->meta.bwr_seq, block->meta.checksum, block->meta.uuid, page);
-		if (!bwr_data) {
-			pr_err("%s hadm%d alloc_bwr_data faild.\n", 
-					__FUNCTION__, bwr->hadmdev->minor);
-			__free_page(page);
-			ret = -1;
-			goto done;
-		}
-
-		memcpy(page_address(bwr_data->data_page), block->data_block, PAGE_SIZE);
-		ret = buffer_data_add(buffer, bwr_data);
-		if (ret < 0) {
-			pr_err("%s hadm%d bwr_data add faild.\n", __FUNCTION__, bwr->hadmdev->minor);
-			__free_page(page);
-			kfree(bwr_data);
-			goto done;
-		}
-	}
-done:
-	if (ret < 0)
-		free_data_buffer(buffer);
-	kfree(block);
 	return ret;
 }
+
+int write_bwr_meta(struct bwr *bwr, int which,
+		   int dstate, uint64_t tail,
+		   uint32_t site_id, uint64_t uuid, uint64_t seq,
+		   uint64_t dev_sector, uint8_t md5[])
+{
+	struct bwr_disk_info *disk_info;
+	int ret = 0;
+
+
+	ret = update_bwr_meta(bwr, which, dstate, tail, site_id,
+			uuid, seq, dev_sector, md5);
+	if (ret < 0) {
+		pr_err("%s: update mem_meta failed.\n", __func__);
+		return ret;
+	}
+
+	wait_for_completion(&bwr->wait);	/* 不是等待，而是获取资源 */
+	if (which == LAST_PRIMARY) {
+		/* FIXME how about wrapper_list, packet_queue? */
+		if (bwr->disk_meta.local_primary.id != INVALID_ID) {
+			bwr_reset(bwr);
+			clear_data_buffer(bwr->hadmdev->buffer);
+		}
+	}
+
+	disk_info = kzalloc(sizeof(struct bwr_disk_info), GFP_KERNEL);
+	if (disk_info == NULL) {
+		pr_err("%s: no memory\n", __func__);
+		ret = -ENOMEM;
+		goto done;
+	}
+	memcpy(&disk_info->meta, &bwr->mem_meta, sizeof(struct bwr_meta));
+	/* NOTE: 写入磁盘失败了怎么办？ */
+	ret = hadm_bio_write_sync(bwr->hadmdev->bwr_bdev,
+				  bwr->disk_meta.meta_start,
+				  (char *)disk_info,
+				  sizeof(struct bwr_disk_info));
+	if (ret) {
+		pr_err("%s: write disk failed: want=%d, write=%d\n",
+		       __func__, (int)sizeof(struct bwr_disk_info), ret);
+		ret = -EIO;
+		goto err_io;
+	}
+	memcpy(&bwr->disk_meta, &disk_info->meta, sizeof(struct bwr_meta));
+
+err_io:
+	kfree(disk_info);
+done:
+	//write_unlock_irqrestore(&bwr->lock, flags);
+	complete(&bwr->wait);	/* 释放资源 */
+	return ret;
+}
+
+static void __bwr_check_last(struct bwr_meta *meta, struct bwr *bwr)
+{
+	int i, ret;
+	uint8_t md5[16];
+	struct page *data;
+
+	data = alloc_page(GFP_KERNEL);
+	if (!data)
+		return;
+
+	ret = hadm_read_page_sync(bwr->hadmdev->bdev,
+			meta->last_primary.last_page,
+			data, PAGE_SIZE);
+	if (ret < 0) {
+		__free_page(data);
+		return ;
+	}
+
+	fullsync_md5_hash(page_address(data), PAGE_SIZE, md5);
+	for (i = 0; i < 16; i++) {
+		if (md5[i] != meta->last_primary.last_page_md5[i]) {
+			pr_info("warning: last page damaged!");
+			meta->last_primary.last_page_damaged = 1;
+			break;
+		}
+	}
+	__free_page(data);
+}
+
 static int __meta_last_page_valid(struct bwr_meta *meta)
 {
 	int i;
@@ -1015,229 +833,175 @@ static int __meta_last_page_valid(struct bwr_meta *meta)
 	return 0;
 }
 
-static void __bwr_check_last(struct bwr_meta *meta, struct hadmdev *hadmdev)
+static int __bwr_check_tail(struct bwr_meta *meta, struct bwr *bwr)
 {
-	int i;
-	uint8_t md5[16];
-	int error;
-	struct page *data;
-	data=alloc_page(GFP_KERNEL);
-	if(IS_ERR_OR_NULL(data)) {
-		return ;
-	}
-	error=hadm_read_page_sync(hadmdev->bdev,meta->last_primary.last_page,data,PAGE_SIZE);
-	if(error) {
-		__free_page(data);
-		return ;
-	}
-	fullsync_md5_hash(page_address(data), PAGE_SIZE, md5);
-	for (i = 0; i < 16; i++) {
-		if (md5[i] != meta->last_primary.last_page_md5[i]) {
-			pr_info("warning: hadm%d bwr last page damaged!", hadmdev->minor);
-			meta->last_primary.last_page_damaged = 1;
-			break;
-		}
-	}
-	__free_page(data);
-}
-
-static int __bwr_check_data(struct bwr_meta *meta, struct hadmdev *hadmdev)
-{
-	int ret;
 	u32 crc;
-	char *buf;
-	uint64_t *tail, *bwr_seq, *head, seq;
+	int ret = 0;
+	uint64_t *head, *tail, *bwr_seq;
+	struct bwr_data *bwr_data;
 	struct bwr_data_meta *data_meta;
-	struct primary_info *pi = NULL;
+	struct hadmdev *dev = bwr->hadmdev;
+	int local_site_id = get_site_id();
 
-	buf = kzalloc(PAGE_SIZE + HADM_SECTOR_SIZE, GFP_KERNEL);
-	if (!buf || IS_ERR(buf)) {
-		pr_err("%s: alloc mem faild.\n", __FUNCTION__);
-		return -ENOMEM;
-	}
-	if(meta->local_primary.id != INVALID_ID) {
-		pi = &meta->local_primary;
-		pr_info("%s: init hadm%d bwr data as a primary node\n", __FUNCTION__, hadmdev->minor);
-	}else if(meta->last_primary.id != INVALID_ID){
-		pi = &meta->last_primary;
-		pr_info("%s: init hadm%d bwr data as a secondary node\n", __FUNCTION__, hadmdev->minor);
-	}else
-	{
-		return -EINVAL;
-	}
-
-
-	pr_info("check hadm%d bwr data.\n", hadmdev->minor);
-	head = &meta->head[get_node_id()];
+	head = &meta->head[local_site_id];
 	tail = &meta->tail;
-	bwr_seq = &pi->bwr_seq;
-	pr_info("%s:init hadm%d bwr data: head = %llu,  tail = %llu, seq = %llu.keep searching unsaved bwr data.\n",
-			__FUNCTION__, hadmdev->minor,
-			(unsigned long long)meta->head[get_node_id()],
-			(unsigned long long)meta->tail,
-			(unsigned long long)pi->bwr_seq);
-	if(*bwr_seq > 1) {
-		seq = *bwr_seq - bwr_distance(hadmdev->bwr, *head, *tail) / BWR_ALIGN_SECTOR ;
-	}else{
-		seq = 1;
+	bwr_seq = &meta->local_primary.bwr_seq;
+	for (;;) {
+		bwr_data = bwr_data_read(bwr, *tail);
+		if (!bwr_data) {
+			pr_err("%s: read bwr_data faild.\n", __func__);
+			ret = -ENOMEM;
+			break;
+		}
+		data_meta = &bwr_data->meta;
+		if (data_meta->uuid != meta->local_primary.uuid ||
+				data_meta->bwr_seq != *bwr_seq + 1) {
+			pr_info("%s: meta not equal, seq(%llu:%llu),"
+					"uuid(%llu:%llu)(data:meta)."
+					"check bwr data exit.\n", __func__,
+					data_meta->bwr_seq, *bwr_seq,
+					data_meta->uuid, meta->local_primary.uuid);
+			bwr_data_put(bwr_data);
+			break;
+		}
+		crc = crc32(0, page_address(bwr_data->data_page), PAGE_SIZE);
+		if (crc != data_meta->checksum) {
+			pr_info("crc32 not equal.(data:meta)(%u:%u). check bwr data exit.\n",
+					crc, data_meta->checksum);
+			bwr_data_put(bwr_data);
+			break;
+		}
+
+		ret = hadm_write_page_sync(dev->bdev, data_meta->dev_sector,
+				bwr_data->data_page, PAGE_SIZE);
+		if (ret < 0) {
+			pr_err("%s: write unfinished tail data failed.\n",
+					__func__);
+			bwr_data_put(bwr_data);
+			break;
+		}
+
+
+		*head = bwr_next_sector(bwr, *tail);
+		*tail = bwr_next_sector(bwr, *tail);
+		(*bwr_seq)++;
+
+		bwr_data_put(bwr_data);
 	}
 
-	/**
-	 *从bwr head位置一直检索数据，直到bwr块invalid
-	 *这里存在一个问题，如果head = tail的话，需要block的bwr_seq是否<local_primary.bwr_seq，
-	 *如果小于，则表明tail的数据是非法的
-	 *
-	 */
-	for (;;) {
-		ret = hadm_read_bwr_block(hadmdev->bwr_bdev, *head,
-				buf, PAGE_SIZE + HADM_SECTOR_SIZE);
-		if (ret != PAGE_SIZE + HADM_SECTOR_SIZE) {
-			pr_err("%s: read hadm%d bwr_data faild.\n", __FUNCTION__, hadmdev->minor);
-			goto out;
-		}
-		data_meta = (struct bwr_data_meta *)buf;
-		/**
-		 *检索head开始的所有bwr block，要求
-		 *1、uuid相等
-		 *2、seq相差1
-		 *3、bwr_sector = *head
-		 *4、seq_to_bwr(seq, bwr) = bwr_sector
-		 */
-		/**
-		if(*head == *tail && data_meta->bwr_seq < *bwr_seq){
-			break;
-		}**/
-		if (data_meta->uuid != pi->uuid ||
-				(seq && data_meta->bwr_seq != seq+1) ||
-				data_meta->bwr_sector != *head ||
-				seq_to_bwr(data_meta->bwr_seq , hadmdev->bwr) != data_meta->bwr_sector){
-			pr_info("%s:invalid bwr block,  hadm%d block sector:%llu(expect:%llu), seq:%llu(expect:%llu), uuid:%llu(expect:%llu), bwr data search terminated\n",
-					__FUNCTION__, hadmdev->minor,
-					(unsigned long long)data_meta->bwr_sector, (unsigned long long)*head,
-					(unsigned long long)data_meta->bwr_seq,  (unsigned long long)seq+1,
-					(unsigned long long)data_meta->uuid,  (unsigned long long)pi->uuid);
-			break;
-		}
-		crc = crc32(0, buf + HADM_SECTOR_SIZE, PAGE_SIZE);
-		if (crc != data_meta->checksum) {
-			pr_info("crc32 not equal.(data:meta)(%u:%u). check hadm%d bwr data exit.\n",
-					crc, data_meta->checksum, hadmdev->minor);
-			break;
-		}
-#if 0
-		pr_info("%s:init data, load unsaved data(sector %llu) from bwr sector %llu, seq %llu, uuid %llu\n",
-				__FUNCTION__,
-				(unsigned long long)data_meta->dev_sector,
-				(unsigned long long)data_meta->bwr_sector,
-				(unsigned long long)data_meta->bwr_seq,
-				(unsigned long long)data_meta->uuid);
-#endif
-		ret = hadm_bio_write_sync(hadmdev->bdev, data_meta->dev_sector, buf+HADM_SECTOR_SIZE, PAGE_SIZE);
-		if(ret) {
-			break;
-		}
-		*head= bwr_next_sector(hadmdev->bwr, *head);
-		seq = data_meta->bwr_seq;
-	}
-	*bwr_seq = seq ;
-	*tail = *head;
-	if(seq_to_bwr(*bwr_seq +1 , hadmdev->bwr) != *tail) {
-		pr_warn("%s:init hadm%d bwr data seq %llu is not matched with tail %llu, expect tail = %llu\n",
-				__FUNCTION__, hadmdev->minor, (unsigned long long)*bwr_seq, (unsigned long long)*tail,
-				(unsigned long long)seq_to_bwr(*bwr_seq + 1 , hadmdev->bwr));
-		ret = -1;
-	}else {
-		pr_info("%s:init hadm%d bwr data , load all unsaved data from bwr,  now tail = %llu, seq = %llu\n",
-				__FUNCTION__, hadmdev->minor, (unsigned long long)*tail, (unsigned long long)*bwr_seq);
-		ret = 0;
-	}
-out:
-	kfree(buf);
 	return ret;
 }
 
-static int bwr_init_meta(struct bwr *bwr, uint64_t meta_offset)
+int __bwr_load_unfinished_data(struct bwr_meta *meta, struct bwr *bwr)
 {
-	struct bwr_disk_info *disk_meta;
 	int ret = 0;
-	struct page *page;
-	int error;
+	uint64_t *head;
+	struct bwr_data *bwr_data;
+	struct bwr_data_meta *data_meta;
 
-	page=alloc_page(GFP_KERNEL);
-	if(IS_ERR_OR_NULL(page)){
-		pr_err("%s: no memory\n", __FUNCTION__);
-		return -ENOMEM;
-	}
-	error=hadm_read_page_sync(bwr->hadmdev->bwr_bdev,meta_offset,page,sizeof(struct bwr_disk_info));
-	if(error) {
-		return error;
-	}
-	disk_meta=(struct bwr_disk_info *)page_address(page);
-	if (disk_meta->meta.magic == MAGIC) {
-		if (disk_meta->meta.local_primary.id == INVALID_ID &&
-				__meta_last_page_valid(&disk_meta->meta)){
-			__bwr_check_last(&disk_meta->meta, bwr->hadmdev);
+	pr_info("%s: try load unfinished local data.\n", __func__);
+	head = &meta->head[get_site_id()];
+	while (*head != meta->tail) {
+		bwr_data = bwr_data_read(bwr, *head);
+		if (!bwr_data) {
+			pr_err("%s: read bwr data(%llu) failed.\n",
+					__func__, *head);
+			return -ENOMEM;
 		}
-		if ((disk_meta->meta.local_primary.id != INVALID_ID ||
-				disk_meta->meta.last_primary.id != INVALID_ID) && disk_meta->meta.disk_state == D_CONSISTENT){
-			if(__bwr_check_data(&disk_meta->meta, bwr->hadmdev)){
-				ret = -EINVAL;
-				goto done;
-			}
-		}else if(disk_meta->meta.last_primary.id != INVALID_ID && disk_meta->meta.disk_state == D_INCONSISTENT) {
-			disk_meta->meta.last_primary.bwr_seq = 0 ;
 
-		}
-		memcpy(&bwr->mem_meta, &disk_meta->meta, sizeof(struct bwr_meta));
-		sync_disk_meta(bwr);
-#if 0
-		/**
-		 *当手动删除一个节点时，必须重新init meta，否则该节点的head仍然保存在bwr
-		 *中，会造成bug，因为__bwr_get_min_head不校验节点是否存在，而sync_dbm_thread
-		 *会，这就导致sync_dbm_thread无法将不存在的节点的head进行更改，导致bwr一直处于
-		 *满的状态
-		 */
-		for(i = 0 ; i < MAX_NODES; i++) {
-			if(find_hadm_node_by_id(bwr->hadmdev, i) == NULL) {
-				disk_meta->meta.head[i] = INVALID_SECTOR;
-			}
-		}
-		sync_disk_meta(bwr);
-		local_node_id = get_node_id();
-
-		distance = bwr_distance(bwr,
-				bwr->disk_meta.head[local_node_id],
-				bwr->disk_meta.tail);
-		if (distance > get_max_bwr_cache_size()) {
-			pr_err("%s: BWR cache too big, head = %llu,  tail = %llu\n", __FUNCTION__,
-					(unsigned long long)bwr->disk_meta.head[local_node_id],
-					(unsigned long long)bwr->disk_meta.tail);
+		data_meta = &bwr_data->meta;
+		if (*head != data_meta->bwr_sector) {
+			pr_err("%s: offset(%llu) not equal to block bwr"
+					"sector (%lu)\n",
+			     __func__, *head, data_meta->bwr_sector);
+			bwr_data_put(bwr_data);
 			ret = -EINVAL;
-			goto done;
+			break;
 		}
-		/* init phase: mema_meta equals disk_meta */
-		bwr_update_inuse_size(bwr);
-		bwr->min_disk_head = __bwr_get_min_head(bwr, &bwr->min_node_mask);
-		distance = bwr_distance(bwr, bwr->min_disk_head, bwr->mem_meta.tail);
-		__bwr_set_inuse_size(bwr, distance);
-		pr_info("%s: set bwr inuse size to %lu, min_disk_head = %lu\n", __FUNCTION__,
-				bwr->inuse_size, bwr->min_disk_head);
-#endif
-	} else if (disk_meta->meta.magic == BWR_UNINIT_MAGIC) {
-		/* using default meta which already inited */
-	} else {
-		pr_err("%s: hadm%d BWR magic is NOT right\n", __FUNCTION__, bwr->hadmdev->minor);
-		ret = -EINVAL;
+
+		ret = hadm_write_page_sync(bwr->hadmdev->bdev,
+				data_meta->dev_sector, bwr_data->data_page, PAGE_SIZE);
+		if (ret < 0) {
+			pr_err("%s: write bwr data failed.\n",
+					__func__);
+			dump_bwr_data(__func__, bwr_data);
+			ret = -EIO;
+			break;
+		}
+
+		dump_bwr_data(__func__, bwr_data);
+		(*head) = bwr_next_sector(bwr, *head);
+		bwr_data_put(bwr_data);
+
+		//buffer_data_add(buffer, bwr_data);
+	}
+
+	pr_info("%s: head: %llu.\n", __func__, *head);
+	return ret;
+}
+
+/* load disk meta to memory meta */
+int load_bwr_meta(struct bwr *bwr)
+{
+	int ret;
+	struct page *meta_page;
+	struct bwr_meta *disk_meta;
+	int local_site_id = get_site_id();
+
+	meta_page = alloc_page(GFP_KERNEL);
+	if (!meta_page) {
+		ret = -ENOMEM;
 		goto done;
 	}
 
+	ret = hadm_read_page_sync(bwr->hadmdev->bwr_bdev,
+			bwr->disk_meta.meta_start,
+			meta_page, PAGE_SIZE);
+	if (ret < 0) {
+		pr_err("%s: sync meta failed.\n", __func__);
+		ret = -EIO;
+		goto free_page;
+	}
+
+	disk_meta = &((struct bwr_disk_info *)page_address(meta_page))->meta;
+	if (disk_meta->magic == MAGIC) {
+		if (disk_meta->local_primary.id == INVALID_ID) {
+			/* secondary: check last bwr_data */
+			if (__meta_last_page_valid(disk_meta))
+				__bwr_check_last(disk_meta, bwr);
+		} else {
+			/* primary: load unfinished data */
+			if (disk_meta->head[local_site_id] != disk_meta->tail)
+				__bwr_load_unfinished_data(disk_meta, bwr);
+			__bwr_check_tail(disk_meta, bwr);
+		}
+
+		bwr->disk_meta = bwr->mem_meta = *disk_meta;
+
+		bwr->min_disk_head = __bwr_get_min_head(bwr, &bwr->min_site_mask);
+
+		//distance = bwr_distance(bwr, bwr->min_disk_head, bwr->mem_meta.tail);
+		/* init phase: mema_meta equals disk_meta */
+		//__bwr_set_inuse_size(bwr, distance);
+		//bwr_update_inuse_size(bwr);
+	} else if (disk_meta->magic == BWR_UNINIT_MAGIC) {
+		/* using default meta which already inited */
+	} else {
+		pr_err("%s: BWR magic is NOT right\n", __func__);
+		ret = -EINVAL;
+		goto free_page;
+	}
+
+	sync_bwr_meta(bwr);
+
+free_page:
+	__free_page(meta_page);
 done:
-	__free_page(page);
 	return ret;
 }
 
 void bwr_meta_init_default(struct bwr_meta *meta, uint8_t dev_id, uint64_t bwr_disk_size,
-		sector_t meta_start, sector_t dbm_start, sector_t bwr_start)
+			   sector_t meta_start, sector_t dbm_start, sector_t bwr_start)
 {
 	int i;
 
@@ -1250,7 +1014,7 @@ void bwr_meta_init_default(struct bwr_meta *meta, uint8_t dev_id, uint64_t bwr_d
 
 	for (i = 0; i < MAX_NODES; i++)
 		meta->head[i] = INVALID_SECTOR;
-	meta->head[get_node_id()] = meta->bwr_start;
+	meta->head[get_site_id()] = meta->bwr_start;
 	meta->tail = meta->bwr_start;
 	meta->disk_state = D_CONSISTENT;
 	primary_info_init(&meta->last_primary);
@@ -1264,9 +1028,11 @@ void __bwr_init(struct bwr *bwr, sector_t max_sector, uint64_t bwr_disk_size,
 	bwr->max_sector = max_sector;
 	bwr->max_size = max_sector - bwr_offset;
 	bwr->inuse_size = 0;
-	bwr->last_seq = 0;
-	bwr->min_disk_head = INVALID_SECTOR;
-	bwr->min_node_mask = 0 ;
+
+	bwr->low_water = bwr->max_size * BWR_FLUSH_LOW_WATER / 10;
+	bwr->high_water = bwr->max_size * BWR_FLUSH_HIGH_WATER / 10;
+	abi_init(&bwr->abi);
+
 	atomic64_set(&bwr->cache, 0);
 	atomic64_set(&bwr->nleft, max_sector - bwr_offset);
 	init_completion(&bwr->have_snd_data);
@@ -1274,14 +1040,14 @@ void __bwr_init(struct bwr *bwr, sector_t max_sector, uint64_t bwr_disk_size,
 
 	rwlock_init(&bwr->lock);
 	bwr_meta_init_default(&bwr->disk_meta, bwr->hadmdev->minor,
-			bwr_disk_size,
-			meta_offset, dbm_offset, bwr_offset);
+			      bwr_disk_size,
+			      meta_offset, dbm_offset, bwr_offset);
 	memcpy(&bwr->mem_meta, &bwr->disk_meta, sizeof(struct bwr_meta));
 	init_completion(&bwr->wait);
 	complete(&bwr->wait);	/* 在同一个时刻只有一个线程可以写 meta */
 
-	init_completion(&bwr->sync_node_finish);
-	spin_lock_init(&bwr->sync_node_mask_lock);
+	init_completion(&bwr->sync_site_finish);
+	spin_lock_init(&bwr->sync_site_mask_lock);
 
 	rwlock_init(&bwr->bwr_data_list_rwlock);
 	INIT_LIST_HEAD(&bwr->bwr_data_list);
@@ -1291,66 +1057,26 @@ void __bwr_init(struct bwr *bwr, sector_t max_sector, uint64_t bwr_disk_size,
 	sema_init(&bwr->sema, 0);
 }
 
-int valid_bwr_meta(struct bwr *bwr)
-{
-	struct bwr_meta *meta = &bwr->mem_meta;
-	struct primary_info *pi = NULL;
-	int secondary = 0 ;
-	if(meta->local_primary.id != INVALID_ID) {
-		pi = &meta->local_primary;
-	}else if (meta->last_primary.id != INVALID_ID){
-		pi = &meta->last_primary;
-		secondary = 1;
-	}else {
-		return 0;
-	}
-	if(secondary && meta->disk_state == D_INCONSISTENT && pi->bwr_seq > 0 ){
-		return -1;
-	}
-	if(seq_to_bwr(pi->bwr_seq + 1, bwr) != meta->tail) {
-		return -1;
-	}
-	return 0;
-}
-
-int bwr_init(struct hadmdev *dev, char *bwr_disk, uint64_t bwr_max, uint64_t bwr_disk_size,
-		uint64_t meta_offset, uint64_t dbm_offset, uint64_t bwr_offset)
+int bwr_init(struct hadmdev *dev, uint64_t bwr_max, uint64_t bwr_disk_size,
+	     uint64_t meta_offset, uint64_t dbm_offset, uint64_t bwr_offset)
 {
 	static char *bwr_identity = "bwr_init";
 	struct bwr *bwr = dev->bwr;
-	struct request_queue *q;
-	int ret = 0;
+	int ret;
 
-	dev->bwr_bdev = blkdev_get_by_path(bwr_disk, BWRDEV_MODE, (void *)bwr_identity);
+	dev->bwr_bdev = blkdev_get_by_path(dev->local_site->conf.bwr_disk,
+					   BWRDEV_MODE, (void *)bwr_identity);
 	if (IS_ERR(dev->bwr_bdev)) {
-		pr_err("%s: hadm%d get %s failed\n",
-				__FUNCTION__, bwr->hadmdev->minor, dev->local->conf.bwr_disk);
-		return PTR_ERR(dev->bwr_bdev);
+		ret = PTR_ERR(dev->bwr_bdev);
+		dev->bwr_bdev = NULL;
+		pr_err("%s: get %s failed\n",
+		       __func__, dev->local_site->conf.bwr_disk);
+		return ret;
 	}
-	q = bdev_get_queue(dev->bwr_bdev);
-	blk_queue_merge_bvec(q, NULL);
-
+	set_device_ro(dev->bwr_bdev, 1);
 	__bwr_init(bwr, bwr_max, bwr_disk_size, meta_offset, dbm_offset, bwr_offset);
 
-	ret = bwr_init_meta(bwr, meta_offset);
-	if (ret < 0) {
-		pr_err("%s: init hadm%d bwr meta failed\n", __FUNCTION__, bwr->hadmdev->minor);
-		goto done;
-	}
-	ret = bwr_init_data_list(bwr);
-	if (ret < 0) {
-		pr_err("%s: init hadm%d data list failed\n", __FUNCTION__, bwr->hadmdev->minor);
-		goto done;
-	}
-	ret = valid_bwr_meta(bwr);
-	if (ret < 0) {
-		pr_err("%s: hadm%d BWR meta is invalid\n", __FUNCTION__, bwr->hadmdev->minor);
-		bwr_dump(bwr);
-		goto done;
-	}
-
-done:
-	return ret;
+	return 0;
 }
 
 void bwr_data_list_clean(struct bwr *bwr)
@@ -1365,46 +1091,188 @@ void bwr_data_list_clean(struct bwr *bwr)
 	write_unlock(&bwr->bwr_data_list_rwlock);
 }
 
+/* TODO: 检查 dbm 的大小和它的 disk_state 是否一致。一致返回 0，否则返回非 0 */
+int valid_bwr_meta(struct bwr *bwr)
+{
+	return 0;
+}
 
 void bwr_meta_dump(struct bwr_meta *meta)
 {
 	int i;
-	printk(KERN_INFO "%s:\n", __FUNCTION__);
+
+	printk(KERN_INFO "%s:\n", __func__);
 	printk(KERN_INFO "\tmagic: %llu, dev_id: %d\n"
-			"disk_size: %llu, bwr_disk_size: %llu\n"
-			"meta_start: %llu, dbm_start: %llu, bwr_start: %llu\n\n",
-			(unsigned long long)meta->magic, meta->dev_id,
-			(unsigned long long)meta->disk_size, (unsigned long long)meta->bwr_disk_size,
-			(unsigned long long)meta->meta_start, (unsigned long long)meta->dbm_start, (unsigned long long)meta->bwr_start);
+	       "disk_size: %llu, bwr_disk_size: %llu\n"
+	       "meta_start: %llu, dbm_start: %llu, bwr_start: %llu\n\n",
+	       (unsigned long long)meta->magic, meta->dev_id,
+	       (unsigned long long)meta->disk_size, (unsigned long long)meta->bwr_disk_size,
+	       (unsigned long long)meta->meta_start, (unsigned long long)meta->dbm_start, (unsigned long long)meta->bwr_start);
 
 	printk(KERN_INFO "head:\n");
-	for (i = 0; i < MAX_NODES; i++){
-		if(meta->head[i] != INVALID_SECTOR) {
-			printk(KERN_INFO "%d:%llu", i, (unsigned long long)meta->head[i]);
-		}
-	}
+	for (i = 0; i < MAX_NODES; i++)
+		printk(KERN_INFO " %llu", (unsigned long long)meta->head[i]);
 	printk(KERN_INFO "\ntail: %llu, disk_state: %d\n\n", (unsigned long long)meta->tail, meta->disk_state);
 
 	printk(KERN_INFO "last_primary: id=%d, uuid=%llu, bwr_seq=%llu\n",
-			meta->last_primary.id, (unsigned long long)meta->last_primary.uuid,
-			(unsigned long long)meta->last_primary.bwr_seq);
+	       meta->last_primary.id, (unsigned long long)meta->last_primary.uuid,
+	       (unsigned long long)meta->last_primary.bwr_seq);
 	printk(KERN_INFO "local_primary: id=%d, uuid=%llu, bwr_seq=%llu\n",
-			meta->local_primary.id, (unsigned long long)meta->local_primary.uuid,
-			(unsigned long long)meta->local_primary.bwr_seq);
+	       meta->local_primary.id, (unsigned long long)meta->local_primary.uuid,
+	       (unsigned long long)meta->local_primary.bwr_seq);
 }
 
-void bwr_dump(struct bwr *bwr)
+void bwr_reset(struct bwr *bwr)
 {
-	unsigned long flags;
-	//dump_stack();
-	read_lock_irqsave(&bwr->lock, flags);
-	__bwr_dump(bwr);
-	read_unlock_irqrestore(&bwr->lock, flags);
+	struct hadm_site *hadm_site;
+
+	pr_info("reset bwr meta & dbm:");
+	bwr->mem_meta.tail = bwr->mem_meta.bwr_start;
+	list_for_each_entry(hadm_site, &bwr->hadmdev->hadm_site_list, site) {
+		bwr->mem_meta.head[hadm_site->id] = bwr->mem_meta.bwr_start;
+		__hadm_site_reset_send_head(hadm_site);
+		__hadm_site_set(&hadm_site->s_state, S_DSTATE, D_CONSISTENT);
+		if (hadm_site->id != get_site_id()) {
+			pr_info("clean dbm for site:%d.\n", hadm_site->id);
+			//dbm_dump(hadm_site->dbm);
+			dbm_clear_bit_all(hadm_site->dbm);
+			dbm_store(hadm_site->dbm);
+		}
+	}
 }
 
-void bwr_reset(struct bwr *bwr,  uint64_t bwr_seq)
+uint64_t gen_sync_site_mask(struct bwr *bwr)
 {
+	struct hadm_site *hadm_site;
+	uint64_t sync_site_mask = 0;
+	int local_site_id = get_site_id();
 
+	spin_lock(&bwr->sync_site_mask_lock);
+	list_for_each_entry(hadm_site, &bwr->hadmdev->hadm_site_list, site) {
+		if (hadm_site->id != local_site_id &&
+				hadm_site->conf.real_protocol == PROTO_SYNC)
+			sync_site_mask |= 1 << hadm_site->id;
+	}
+	bwr->sync_site_mask = sync_site_mask;
+	spin_unlock(&bwr->sync_site_mask_lock);
+
+	return sync_site_mask;
 }
 
 /* -------------------------------- obsolete functions ------------------------*/
+int bwr_init_meta(struct bwr *bwr, uint64_t meta_offset)
+{
+	int ret;
+	int64_t distance;
+	int local_site_id;
+	struct page *page;
+	struct bwr_meta *disk_meta;
+
+	page = alloc_page(GFP_KERNEL);
+	if (!page) {
+		ret = -ENOMEM;
+		pr_err("%s: no memory\n", __func__);
+		goto out;
+	}
+
+	ret = hadm_read_page_sync(bwr->hadmdev->bwr_bdev, meta_offset,
+			page, PAGE_SIZE);
+	if (ret < 0) {
+		pr_err("%s: read disk meta failed.\n", __func__);
+		goto free_page;
+	}
+
+	disk_meta = &((struct bwr_disk_info *)page_address(page))->meta;
+	if (disk_meta->magic == MAGIC) {
+		if (disk_meta->local_primary.id == INVALID_ID)
+			if (__meta_last_page_valid(disk_meta))
+				__bwr_check_last(disk_meta, bwr);
+		if (disk_meta->local_primary.id != INVALID_ID)
+			__bwr_check_tail(disk_meta, bwr);
+		memcpy(&bwr->disk_meta, disk_meta, sizeof(struct bwr_meta));
+		memcpy(&bwr->mem_meta, disk_meta, sizeof(struct bwr_meta));
+		bwr->min_disk_head = __bwr_get_min_head(bwr, &bwr->min_site_mask);
+		local_site_id = get_site_id();
+
+		distance = bwr_distance(bwr,
+					bwr->disk_meta.head[local_site_id],
+					bwr->disk_meta.tail);
+		if (distance > get_max_bwr_cache_size()) {
+			pr_err("%s: BWR cache too big\n", __func__);
+			ret = -EINVAL;
+			goto free_page;
+		}
+
+		distance = bwr_distance(bwr, bwr->min_disk_head, bwr->disk_meta.tail);
+		/* init phase: mema_meta equals disk_meta */
+		__bwr_set_inuse_size(bwr, distance);
+		//bwr_update_inuse_size(bwr);
+	} else if (disk_meta->magic == BWR_UNINIT_MAGIC) {
+		/* using default meta which already inited */
+	} else {
+		pr_err("%s: BWR magic is NOT right\n", __func__);
+		ret = -EINVAL;
+		goto free_page;
+	}
+
+free_page:
+	__free_page(page);
+out:
+	return ret;
+}
+
+int bwr_init_data_list(struct bwr *bwr)
+{
+	struct bwr_data_block *block;
+	struct bwr_data *bwr_data;
+	uint64_t offset;
+	struct page *page;
+	int ret = 0, local_site_id;
+	struct data_buffer *buffer = bwr->hadmdev->buffer;
+
+	if (bwr->disk_meta.local_primary.id == INVALID_ID)
+		return 0;
+	pr_info("try load unfinished local_site data.\n");
+	local_site_id = get_site_id();
+	block = kzalloc(sizeof(struct bwr_data_block), GFP_KERNEL);
+	for (offset = bwr->disk_meta.head[local_site_id];
+	     offset != bwr->disk_meta.tail;
+	     offset = bwr_next_sector(bwr, offset)) {
+		hadm_read_bwr_block(bwr->hadmdev->bwr_bdev,offset,(char *)block,sizeof(struct bwr_data_block));
+		if (offset != block->meta.bwr_sector) {
+			pr_err("%s: offset(%lu) not equal to block bwr sector (%lu)\n",
+			     __func__, (unsigned long)offset,
+			     (unsigned long)block->meta.bwr_sector);
+			ret = -1;
+			goto done;
+		}
+
+		page = alloc_page(GFP_KERNEL);
+		if (!page) {
+			ret = -1;
+			goto done;
+		}
+		bwr_data = init_bwr_data(offset, block->meta.dev_sector,
+				block->meta.bwr_seq, block->meta.checksum, block->meta.uuid, page);
+		if (!bwr_data) {
+			pr_err("%s alloc_bwr_data faild.\n", __func__);
+			__free_page(page);
+			ret = -1;
+			goto done;
+		}
+
+		memcpy(page_address(bwr_data->data_page), block->data_block, PAGE_SIZE);
+		ret = buffer_data_add(buffer, bwr_data);
+		if (ret < 0) {
+			pr_err("%s bwr_data add faild.\n", __func__);
+			__free_page(page);
+			kfree(bwr_data);
+			goto done;
+		}
+	}
+done:
+	if (ret < 0)
+		free_data_buffer(buffer);
+	kfree(block);
+	return ret;
+}

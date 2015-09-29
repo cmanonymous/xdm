@@ -49,4 +49,11 @@ static const char *proto_name[]  __attribute__ ((unused)) = {
 };
 #endif
 
+#ifndef NOT_USE_NODE_TYPE
+static const char *node_type_name[] __attribute__ ((unused)) = {
+	[LOCAL_NODE] = "node",
+	[SITE_NODE] = "site",
+};
+#endif
+
 #endif // __COMMON_STRING_H__

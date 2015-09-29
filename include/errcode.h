@@ -37,7 +37,8 @@ enum {
 	EKMOD_NONODE = 37,
 	EKMOD_PACKET_WRONG = 38,
 	EKMOD_DUAL_PRIMARY = 39,
-	EKMOD_INSYNC= 40,
+	EKMOD_PEER_BWR_NOT_EMPTY = 40,
+	EKMOD_PEER_BM_NOT_EMPTY = 41,
 	EKMOD_INUSE = 42,
 	EKMOD_SEND_FAIL = 43,
 	EKMOD_LOCAL_ROLE = 44,
@@ -48,7 +49,7 @@ enum {
 	EKMOD_BAD_CSTATE = 49,
 	EKMOD_BAD_DSTATE = 50,
 	EKMOD_NOT_PRIMARY = 51,
-	EKMOD_DUP_HS = 52, 
+	EKMOD_MASTER_EXIST = 51,
 
 	/* net: 64~95 */
 	ENET_NEED_FULLSYNC = 64,
@@ -67,7 +68,8 @@ static const char *hadm_str_errno[] = {
 	[EKMOD_NONODE] = "no such node",
 	[EKMOD_PACKET_WRONG] = "wrong packet",
 	[EKMOD_DUAL_PRIMARY] = "already exist a primary node",
-	[EKMOD_INSYNC ] = "peer secondary BWR or DBM is not empty",
+	[EKMOD_PEER_BWR_NOT_EMPTY] = "peer secondary BWR is not empty",
+	[EKMOD_PEER_BM_NOT_EMPTY] = "peer secondary dbm is not empty",
 	[EKMOD_INUSE] = "resource busy",
 	[EKMOD_SEND_FAIL] = "kmod send packet failed",
 	[EKMOD_LOCAL_ROLE] = "local role is not right",
@@ -75,7 +77,6 @@ static const char *hadm_str_errno[] = {
 	[EKMOD_NOT_SUPPORT] = "not support",
 	[EKMOD_NOT_PRIMARY] = "expect primary",
 	[EKMOD_BAD_DSTATE] = "disk state is inconsistent",
-	[EKMOD_DUP_HS] = "duplicate handshake", 
 
 	[ENET_NEED_FULLSYNC] = "remote need fullsync",
 	[EKMOD_UNKNOWN_STATE] = "unknow state",

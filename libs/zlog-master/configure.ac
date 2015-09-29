@@ -37,6 +37,9 @@ AC_FUNC_LSTAT_FOLLOWS_SLASHED_SYMLINK
 AC_FUNC_REALLOC
 AC_CHECK_FUNCS([atexit gethostname gettimeofday localtime_r memmove memset setenv strchr strrchr strtol])
 
-AC_CONFIG_FILES([Makefile
-                 src/Makefile])
+AC_CONFIG_FILES([doc/Makefile
+                 Makefile
+                 src/Makefile
+                 test/Makefile
+                 tools/Makefile])
 AC_OUTPUT

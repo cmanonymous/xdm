@@ -11,7 +11,7 @@
 #include "hadm_def.h"
 #include "hadm_config.h"
 #include "hadm_device.h"
-#include "hadm_node.h"
+#include "hadm_site.h"
 #include "hadm_struct.h"
 #include "hadm_thread.h"
 
@@ -64,13 +64,64 @@ void hadm_free_bio(struct bio *bio)
 	bio_put(bio);
 }
 
-/* 这里是文件系统的数据入口，用户将数据写入设备，将会在这个函数处理这些数据 */
-MAKE_REQUEST_TYPE hadmdev_make_request(struct request_queue *q, struct bio *bio)
+int hadmdev_submit_master_bio(struct hadmdev *dev, struct bio *bio)
 {
 	int ret;
 	struct bio_wrapper *wrapper;
 	struct hadm_queue *wrapper_queue;
-	bio_wrapper_end_io_t *endio;
+
+	wrapper = hadmdev_create_local_wrapper(dev, bio);
+	if (wrapper == NULL) {
+		pr_err("%s alloc wrapper faild.\n", __FUNCTION__);
+		ret = -ENOMEM;
+		goto out;
+	}
+
+	if (bio_data_dir(bio) == READ)
+		wrapper_queue = dev->queues[RD_WRAPPER_Q];
+	else
+		wrapper_queue = dev->queues[WR_WRAPPER_Q];
+	bio_wrapper_prepare_io(wrapper);
+try:
+	ret = hadm_queue_push_timeout(wrapper_queue, &wrapper->node,
+			msecs_to_jiffies(1000));
+	if (ret < 0) {
+		if (hadmdev_error(dev)) {
+			free_bio_wrapper(wrapper);
+			goto out;
+		}
+		if (ret == -EHADM_QUEUE_FREEZE)
+			msleep(500);
+		goto try;
+	}
+
+out:
+	return ret;
+}
+
+int hadmdev_submit_slaver_bio(struct hadmdev *dev, struct bio *bio)
+{
+	int ret;
+	struct sbio *sbio;
+
+	sbio = sbio_create(bio, GFP_KERNEL);
+	if (!sbio)
+		return -ENOMEM;
+
+	ret = hadmdev_sbio_add(dev, sbio);
+	if (ret < 0)
+		goto out;
+	else if (ret == 1)
+		ret = hadmdev_sbio_send(dev, sbio);
+
+out:
+	return ret;
+}
+
+/* 这里是文件系统的数据入口，用户将数据写入设备，将会在这个函数处理这些数据 */
+MAKE_REQUEST_TYPE hadmdev_make_request(struct request_queue *q, struct bio *bio)
+{
+	int ret;
 	struct hadmdev *hadmdev;
 
 	IO_DEBUG("%s: bio:%p, rw=%s, disk_sector=%llu, size=%u[qazz1]\n", __FUNCTION__,
@@ -83,9 +134,6 @@ MAKE_REQUEST_TYPE hadmdev_make_request(struct request_queue *q, struct bio *bio)
 		pr_err("%s no such hadm device.\n", __FUNCTION__);
 		goto fail;
 	}
-	if(hadmdev_error(hadmdev)){
-		goto fail;
-	}
 
 	if (bio_data_dir(bio) == WRITE) {
 		hadmdev->acct_info[W_BIO]++;
@@ -94,36 +142,13 @@ MAKE_REQUEST_TYPE hadmdev_make_request(struct request_queue *q, struct bio *bio)
 	}
 	trace_make_request(NULL);
 
-	endio = bio_data_dir(bio) == READ ? NULL: primary_data_end_io;
-	wrapper_queue = hadmdev->bio_wrapper_queue[bio_data_dir(bio)];
-	wrapper = init_bio_wrapper(bio, endio);
-	if (!wrapper) {
-		pr_err("%s hadm%d alloc wrapper faild.\n", __FUNCTION__, hadmdev->minor);
+	if (hadmdev_local_master(hadmdev))
+		ret = hadmdev_submit_master_bio(hadmdev, bio);
+	else
+		ret = hadmdev_submit_slaver_bio(hadmdev, bio);
+	if (ret < 0)
 		goto fail;
-	}
 
-	if (bio_data_dir(bio) == READ) {
-		submit_read_wrapper(wrapper);
-		goto out;
-	}
-
-	bio_wrapper_prepare_io(wrapper);
-try:
-	ret = hadm_queue_push_timeout_fn(wrapper_queue, &wrapper->node,
-			msecs_to_jiffies(1000),set_sync_mask, wrapper);
-	if (ret < 0) {
-		if (hadmdev_error(hadmdev)) {
-			free_bio_wrapper(wrapper);
-			goto fail;
-		}
-		if (ret == -EHADM_QUEUE_FREEZE)
-			msleep(500);
-		goto try;
-	}
-	if (bio_data_dir(bio) == WRITE) {
-		IO_DEBUG("submit bio_wrapper %p, sync_mask = 0x%llx\n", wrapper, wrapper->sync_node_mask);
-
-	}
 out:
 	MAKE_REQUEST_RETURN(0);
 fail:
@@ -139,8 +164,8 @@ int bio_read_handler_run(void *arg)
 	struct hadm_queue *wrapper_queue;
 	struct hadm_thread *bio_handler;
 
-	bio_handler = dev->worker_thread[BIO_RD_HANDLER];
-	wrapper_queue = dev->bio_wrapper_queue[HADM_IO_READ];
+	bio_handler = dev->threads[BIO_RD_HANDLER];
+	wrapper_queue = dev->queues[RD_WRAPPER_Q];
 
 	while ((hadm_thread_get_state(bio_handler)) == HADM_THREAD_RUN) {
 		bio_wrapper = hadm_queue_pop_entry_timeout(wrapper_queue,
@@ -151,14 +176,14 @@ int bio_read_handler_run(void *arg)
 			continue;
 		}
 		if (hadmdev_error(dev)) {
-			bio_wrapper->err |= -EIO;
-			bio_wrapper_end_io(bio_wrapper);
+			bio_wrapper_end_io(bio_wrapper, -EIO);
 			continue;
 		}
 
 		submit_bio_wrapper(bio_wrapper);
 	}
-	hadm_thread_terminate(bio_handler);
+
+	complete(&bio_handler->ev_exit);
 	return 0;
 }
 
@@ -167,82 +192,51 @@ int bio_write_handler_run(void *arg)
 	struct hadmdev *dev = arg;
 	struct bio_wrapper *bio_wrapper;
 	struct hadm_queue *wrapper_queue;
-	struct list_head *cur_node = NULL,  *cur_node_next = NULL;
 	struct hadm_thread *bio_handler;
-	unsigned long flags;
-	static uint64_t last_sync_mask = 1, sync_mask;
-	struct hadm_pack_node *ack_node = NULL;
-	int local_node_id = get_node_id();
 
-
-	bio_handler = dev->worker_thread[BIO_WR_HANDLER];
-	wrapper_queue = dev->bio_wrapper_queue[HADM_IO_WRITE];
-	hadm_queue_lock(wrapper_queue,flags, 1);
-	cur_node_next = &wrapper_queue->head;
-	wrapper_queue->private = NULL;
-	hadm_queue_unlock(wrapper_queue,flags, 1);
+	bio_handler = dev->threads[BIO_WR_HANDLER];
+	wrapper_queue = dev->queues[WR_WRAPPER_Q];
 
 	while ((hadm_thread_get_state(bio_handler)) == HADM_THREAD_RUN) {
-		if(hadmdev_error(dev)){
-			wrapper_queue_io_error(dev);
-			msleep(2000);
+		bio_wrapper = hadm_queue_pop_entry_timeout(wrapper_queue,
+				struct bio_wrapper, node, msecs_to_jiffies(1000));
+		if (IS_ERR_OR_NULL(bio_wrapper)) {
+			if (PTR_RET(bio_wrapper) == -EHADM_QUEUE_FREEZE)
+				msleep(500);
 			continue;
 		}
-		if(hadmdev_get_primary_id(dev) == local_node_id) {
-			sync_mask = gen_sync_node_mask(dev);
-			if(sync_mask != last_sync_mask) {
-				pr_info("hadm%d sync mask is changed from 0x%llx to 0x%llx.\n",
-						dev->minor,
-						(unsigned long long)last_sync_mask,
-						(unsigned long long)sync_mask);
-				sync_mask_clear_queue(dev, sync_mask, last_sync_mask);
-				last_sync_mask = sync_mask;
-			}
-		}
-
-		hadm_queue_lock(wrapper_queue,flags, 1);
-		if(wrapper_queue->unused == 0){
-			hadm_queue_unlock(wrapper_queue,flags, 1);
-			hadm_queue_wait_data_timeout(wrapper_queue, msecs_to_jiffies(1000));
-			continue;
-		}
-		if(cur_node_next == &wrapper_queue->head) {
-			if(wrapper_queue->private == NULL) {
-				cur_node = cur_node_next->next;
-			}else {
-				cur_node = ((struct list_head *)wrapper_queue->private)->next;
-			}
-		}else {
-			cur_node = cur_node_next;
-		}
-		if(cur_node == NULL || cur_node == &wrapper_queue->head) {
-			pr_warn("%s: hadm%d wrapper_queue->unused = %d , but no data pop from wrapper_queue.\n",
-					__FUNCTION__, dev->minor, wrapper_queue->unused);
-			BUG();
-		}
-		cur_node_next = cur_node->next;
-		wrapper_queue->private = cur_node;
-		bio_wrapper = list_entry(cur_node, struct bio_wrapper , node);
-
-		if(bio_wrapper->private){
-			ack_node = (struct hadm_pack_node *)bio_wrapper->private;
-			if(ack_node->pack->type == P_RS_DATA_ACK) {
-				wrapper_queue->private = NULL;
-				__hadm_queue_del_node(wrapper_queue, &bio_wrapper->node);
-			}
-		}
-		wrapper_queue->unused --;
-		hadm_queue_unlock(wrapper_queue,flags, 1);
-
 		if (hadmdev_error(dev)) {
+			bio_endio(bio_wrapper->bio, bio_wrapper->err);
+			bio_wrapper_end_io(bio_wrapper, bio_wrapper->err);
 			continue;
 		}
-		//TODO: lock
 		if (submit_bio_wrapper(bio_wrapper) < 0) {
-			hadmdev_set_error(dev, __BWR_ERR);
-			bio_wrapper->err |= -EIO;
+			hadmdev_set_error(dev);
+			bio_endio(bio_wrapper->bio, bio_wrapper->err);
+			pr_err("BUG %s: bio io error. %d.\n", __FUNCTION__, bio_wrapper->err);
+			bio_wrapper_end_io(bio_wrapper, bio_wrapper->err);
 		}
+#if 0
+		/* FIXME sync model, implement in future. */
+		sync_node_mask = gen_sync_node_mask(dev->bwr);
+		if (sync_node_mask != last_mask) {
+			pr_info("sync node mask changed: %llu -> %llu.\n", last_mask, sync_node_mask);
+			last_mask = sync_node_mask;
+		}
+
+		if (submit_bio_wrapper(bio_wrapper) < 0)
+			bio_wrapper->err = -EIO;
+		if (!bio_wrapper->err) {
+			if (sync_node_mask) {
+				ret = wait_sync_node_finsh(dev->bwr);
+			}
+		} else {
+			bio_endio(bio_wrapper->bio, bio_wrapper->err);
+			pr_err("BUG %s: bio io error. %d.\n", __FUNCTION__, bio_wrapper->err);
+		}
+#endif
+
 	}
-	hadm_thread_terminate(bio_handler);
+	complete(&bio_handler->ev_exit);
 	return 0;
 }

@@ -6,18 +6,26 @@ struct timer_base {
 	struct thread *timer_thread;
 	struct event_base *event_base;
 	struct timer *connect_timer;
+	struct timer *kmod_check_timer;
 };
 
 struct daemon {
+	int local_site_id;
 	struct node *local_node;
-	struct node_list *node_list;
-	struct device_list *dev_list;
+
+	struct node_list *lnode_list;
+	struct resource_list *resource_list;
+	struct node_list *rnode_list;
+	pthread_spinlock_t rnode_list_lock;
+
+	struct device *dev;
 	struct event_base *event_base;
 	int local_fd;
 	struct event *local_event;
 	event_handler local_handler;
-	struct thread *connect_thread;
-	// struct timer *connect_timer;
+
+	struct thread *local_connect_thread;
+	struct thread *remote_connect_thread;
 	struct timer_base *timer_base;
 };
 

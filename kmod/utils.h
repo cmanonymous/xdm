@@ -15,7 +15,7 @@
 
 #define BLK_SHIFT 12
 
-struct node_config *get_node_by_id(int id, struct config *cfg);
+struct site_config *get_site_by_id(int id, struct config *cfg);
 
 uint64_t get_disk_size(struct dbm* dbm);
 

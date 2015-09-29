@@ -8,7 +8,6 @@
 #define HADM_WRAPPER_H
 
 #include <linux/blkdev.h>
-#include "compat.h"
 
 /*
  * see kernel 2.6.37,
@@ -61,23 +60,11 @@ static inline struct block_device *blkdev_get_by_path(const char *path, fmode_t 
 #  define MAKE_REQUEST_RETURN(a) return a
 #endif	/* COMPAT_HAVE_VOID_MAKE_REQUEST */
 
-#if defined(RHEL_RELEASE)
-#  if RHEL_RELEASE_CODE < RHEL_RELEASE_VERSION(6,5)
-static inline int __must_check PTR_RET(const void *ptr)
-{
-	if (IS_ERR(ptr))
-		return PTR_ERR(ptr);
-	else
-		return 0;
-}
-#  endif
-
-#else
 /*
  * PTR_RET was first appear in fa9ee9c4b9885dfdf8eccac19b8b4fc8a7c53288, version
  * is 2.6.38
  */
-#  if LINUX_VERSION_CODE <= KERNEL_VERSION(2,6,38)
+#if LINUX_VERSION_CODE <= KERNEL_VERSION(2,6,38)
 static inline int __must_check PTR_RET(const void *ptr)
 {
 	if (IS_ERR(ptr))
@@ -85,41 +72,6 @@ static inline int __must_check PTR_RET(const void *ptr)
 	else
 		return 0;
 }
-
-static inline unsigned short queue_max_segments(struct request_queue *q)
-{
-	        return q->limits.max_segment_size;
-}
-
-#  endif  /* PTR_RET */
-
-#endif
-
-#ifndef COMPAT_HAVE_IS_ERR_OR_NULL
-static inline long __must_check IS_ERR_OR_NULL(const void *ptr)
-{
-	        return !ptr || IS_ERR_VALUE((unsigned long)ptr);
-}
-#endif
-
-
-#  ifdef hlist_for_each_entry
-#  undef hlist_for_each_entry
-
-#    define hlist_entry_safe(ptr, type, member) \
-	({ typeof(ptr) ____ptr = (ptr); \
-	   ____ptr ? hlist_entry(____ptr, type, member) : NULL; \
-	})
-
-#    define hlist_for_each_entry(pos, head, member)				\
-	for (pos = hlist_entry_safe((head)->first, typeof(*(pos)), member);\
-	     pos;							\
-	     pos = hlist_entry_safe((pos)->member.next, typeof(*(pos)), member))
-
-#  endif
-
-#ifndef COMPAT_HAVE_PROC_PDE_DATA
-#define PDE_DATA(inode) PDE(inode)->data
-#endif
+#endif  /* PTR_RET */
 
 #endif	/* HADM_WRAPPER_H */

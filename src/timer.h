@@ -2,6 +2,7 @@
 #define __TIMER_H__
 
 struct timer {
+	char name[MAX_NAME_LEN];
 	struct event *timer_event;
 	struct timeval timeout;
 	event_handler timer_handler;
@@ -10,7 +11,7 @@ struct timer {
 
 struct timer *alloc_timer();
 
-struct timer *create_timer(int timeout, event_handler timer_handler, void *data);
+struct timer *create_timer(char *name, int timeout, event_handler timer_handler, void *data);
 
 void free_timer(struct timer *timer);
 

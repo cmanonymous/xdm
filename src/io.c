@@ -16,7 +16,6 @@ ssize_t write_n(int fd, void *data, size_t size)
 			if(errno == -EAGAIN) {
 				continue;
 			} else {
-				log_error("Error: %s failed: %s", __func__, strerror(errno));
 				return n;
 			}
 		}
@@ -44,7 +43,6 @@ ssize_t read_n(int fd, void *data, size_t size)
 			if(errno == -EAGAIN) {
 				continue;
 			} else {
-				log_error("Error: read failed:%s\n", strerror(errno));
 				return n;
 			}
 		}

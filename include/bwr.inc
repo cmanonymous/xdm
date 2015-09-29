@@ -29,12 +29,4 @@ struct bwr_meta {
 
 };
 
-struct bwr_data_meta {
-	uint64_t uuid;
-	uint64_t bwr_seq;
-	uint32_t checksum;
-	uint64_t bwr_sector;
-	uint64_t dev_sector;
-};
-
 #endif  /* __BWR_INC__ */

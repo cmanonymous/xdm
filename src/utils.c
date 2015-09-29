@@ -18,28 +18,26 @@
 #define META_DATA_SIZE_BIT 20
 #define META_DATA_SIZE (1U << META_DATA_SIZE_BIT)
 #define SECON_STATE_FMT "\t%-*s: %s\n" /* host name */\
-	"\t%-*s: %d\n"/* node id */\
         "\t%-*s: %s\n"/* host ip */\
         "\t%-*s: %s(%s)\n"/* replication mode */\
         "\t%-*s: %s\n"/* disk status */\
         "\t%-*s: %s\n"/* data status */\
         "\t%-*s: %s\n"/* replication status */\
-        "\t%-*s: %llu\n"/* replication speed */\
+        "\t%-*s: %lu\n"/* replication speed */\
         "\t%-*s: %s\n"/* network status */\
-        "\t%-*s: %llu\n"/* bwr behind */\
-        "\t%-*s: %llu\n"/* dbm size */\
-        "\t%-*s: %llu\n"/* time distance */
+        "\t%-*s: %lu\n"/* bwr behind */\
+        "\t%-*s: %lu\n"/* dbm size */\
+        "\t%-*s: %lu\n"/* time distance */
 
 #define PRI_STATE_FMT "\t%-*s: %s\n" /* host name */\
-	"\t%-*s: %d\n"/* node id */\
         "\t%-*s: %s\n"/* host ip */\
         "\t%-*s: /dev/%s\n"/*dev path */\
-        "\t%-*s: %llu\n"/* uuid */\
-        "\t%-*s: %llu\n"/* seq_id */\
+        "\t%-*s: %lu\n"/* uuid */\
+        "\t%-*s: %lu\n"/* seq_id */\
         "\t%-*s: %s\n"/* disk state */\
         "\t%-*s: %s\n"/* data state */\
         "\t%-*s: %s\n"/* device state */\
-        "\t%-*s: %llu\n"/* IO stat */\
+        "\t%-*s: %lu\n"/* IO stat */\
         "\t%-*s: %s\n"/* disk device */\
         "\t%-*s: %lu\n"/* disk size */\
         "\t%-*s: %s\n"/* bwr device */\
@@ -64,8 +62,6 @@
         "\t%-*s: %lu\n"/* bwr sizee */\
         "\t%-*s: %lu\n"/* dbm_size */
 #define DOWN_STATE_FMT "\t%-*s: %s\n" /* nstate */
-#define RBWR_STATE_NODE_FMT "\t%-*s: %lu\n" /* rbwr size */
-#define RBWR_STATE_NODE_FMT_LEN 8
 
 int make_timespec(long msec, struct timespec *ts)
 {
@@ -114,7 +110,7 @@ int check_kmod(const char *kmod_name)
                 memset(line, 0, sizeof(line));
                 tmp = fgets(line, sizeof(line), file);
 
-                if(!strcmp(kmod_name, line)) {
+                if(!strncmp(kmod_name, line, strlen(kmod_name))) {
                         ret = 1;
                         break;
                 }
@@ -129,17 +125,22 @@ int check_local_resource(struct res_config *res, struct config *cfg)
 {
         int ret = 0;
         int idx;
-        struct runnode_config *res_iter;
+        struct runsite_config *res_iter;
 
-        for (idx = 0; idx < res->runnode_num; idx++) {
-                res_iter = &res->runnodes[idx];
-                if (cfg->local_node_id == res_iter->id){
+        for (idx = 0; idx < res->runsite_num; idx++) {
+                res_iter = &res->runsites[idx];
+                if (cfg->local_site_id == res_iter->id){
                         ret = 1;
                         break;
                 }
         }
 
         return ret;
+}
+
+void daemonize()
+{
+	daemon(0, 0);
 }
 
 int get_bwr_info(struct res_config *res, struct config *cfg, uint64_t *data_len,
@@ -156,38 +157,32 @@ int get_bwr_info(struct res_config *res, struct config *cfg, uint64_t *data_len,
         uint64_t total_dbm_sectors;
         uint64_t num_blocks = 0;
 
-        if (get_res_path(res, cfg, cfg->local_node_id, res_name, bwr_name) == -1)
-        {
+        if (get_res_path(res, cfg->local_site_id, res_name, bwr_name) == -1) {
                 log_error("error: can't get resource path in config file.");
                 return -1;
         }
 
         fd = open(res_name, O_RDONLY);
-        if (fd == -1){
-                log_error("error: can't open resource device %s: %s.",
-				res_name, strerror(errno));
+        if (fd == -1) {
+                log_error("error: can't open resource device: %s.", strerror(errno));
                 return -1;
         }
         ret = ioctl(fd, BLKGETSIZE, &num_blocks);
-        if (ret == -1){
-                log_error("error: ioctl resource device %s: %s.",
-				res_name, strerror(errno));
+        if (ret == -1) {
+                log_error("error: ioctl resource device : %s.", strerror(errno));
                 return -1;
         }
-        //num_blocks = ((num_blocks + 32767) / 32768) * 32768;
 	num_blocks = (num_blocks >> 15) <<15 ;
         total_dbm_sectors = MAX_NODES * num_blocks / (BLK_SIZE * 8);
         close(fd);
 
-        fd = open(bwr_name, O_RDWR);
-        if (fd == -1)
-        {
+        fd = open(bwr_name, O_RDONLY);
+        if (fd == -1) {
                 log_error("error: open bwr device  : %s", strerror(errno));
                 return -1;
         }
         ret = ioctl(fd, BLKGETSIZE, &num_blocks);
-        if ( ret == -1)
-        {
+        if (ret == -1) {
                 log_error("error: ioctl bwr device : %s", strerror(errno));
                 return -1;
         }
@@ -205,69 +200,173 @@ int get_bwr_info(struct res_config *res, struct config *cfg, uint64_t *data_len,
         return 0;
 }
 
-int pack_fill_bwr(struct conf_packet *conf_pkt, struct config * cfg)
+int trim_nonlocal_res(struct config *cfg)
 {
-        int idx;
-        int ret;
-        uint64_t data_len;
-        uint64_t meta_offset;
-        uint64_t dbm_offset;
-        uint64_t dbm_size;
-        uint64_t bwr_offset;
-        uint64_t bwr_disk_size;
-        struct res_conf_packet *res_pkt;
-        struct res_config *res;
+        int ridx, nidx, non_locals;
+        struct res_config *res, *res_iter;
+        struct runsite_config *site;
+		int i = 0;
 
-        res_pkt = (struct res_conf_packet *)(conf_pkt->data
-			+ (sizeof(struct node_conf_packet) * conf_pkt->node_num)
-			+ (sizeof(struct server_conf_packet) * conf_pkt->server_num));
-        res = find_res_by_name(res_pkt->name, cfg);
+        non_locals = 0;
+        res = malloc(sizeof(struct res_config) * cfg->res_num);
         if (res == NULL) {
-                log_error("error: can not find the resource");
-                return -ECMD_NO_RESOURCE;
+                log_error("error: not enough memory!");
+                return -1;
         }
-        for (idx = 0; idx < conf_pkt->res_num; idx++){
-                ret = get_bwr_info(res, cfg,
-                                   &data_len, &meta_offset, &dbm_offset, &dbm_size,
-                                   &bwr_offset, &bwr_disk_size);
-                if (ret < 0) {
-			return -ECMD_GET_BWRINFO;
+        memset(res, 0, sizeof(struct res_config) * cfg->res_num);
+
+        for (ridx = 0; ridx < cfg->res_num; ridx++) {
+                res_iter = &cfg->res[ridx];
+                for (nidx = 0; nidx < res_iter->runsite_num; nidx++) {
+                        site = &res_iter->runsites[nidx];
+                        if (site->id == cfg->local_site_id)
+                                break;
+                }
+
+                if (nidx < res_iter->runsite_num) {
+                        memcpy(&res[i++], res_iter, sizeof(struct res_config));
+                }
+                else {
+                        non_locals++;
+                }
+        }
+
+        free(cfg->res);
+        cfg->res = res;
+        cfg->res_num -= non_locals;
+        return 0;
+}
+
+struct res_conf_packet *res_start(struct conf_packet *pkt)
+{
+	struct site_conf_packet *site;
+	char *ptr;
+	int i;
+
+	ptr = pkt->data;	/* res start */
+	for (i = 0; i < pkt->site_num; i++) {
+		site = (struct site_conf_packet *)ptr;
+		ptr = site->data;
+		ptr += site->node_num * sizeof(struct node_conf_packet);
+	}
+
+	return (struct res_conf_packet *)ptr;
+}
+
+struct res_conf_packet *res_entry(struct conf_packet *cfg_pkt, int id)
+{
+	struct res_conf_packet *res;
+	struct runsite_conf_packet *runsite;
+	char *ptr;
+	int i, j;
+
+	res = res_start(cfg_pkt);
+	for (i = 0; i < id; i++) {
+		ptr = (char *)res->data; /* runsite start */
+		for (j = 0; j < res->runsite_num; j++) {
+			runsite = (struct runsite_conf_packet *)ptr;
+			ptr = runsite->data; /* runnode start */
+			ptr += runsite->runnode_num * sizeof(struct node_conf_packet);
 		}
+		res = (struct res_conf_packet *)ptr;
+	}
+
+	return res;
+}
+
+int pack_fill_bwr(struct conf_packet *conf_pkt, struct config *cfg)
+{
+	int idx;
+	int ret;
+	uint64_t data_len;
+	uint64_t meta_offset;
+	uint64_t dbm_offset;
+	uint64_t dbm_size;
+	uint64_t bwr_offset;
+	uint64_t bwr_disk_size;
+	struct res_conf_packet *res_pkt;
+	struct res_config *res;
+
+	for (idx = 0; idx < conf_pkt->res_num; idx++) {
+		res_pkt = res_entry(conf_pkt, idx);
+		res = find_res_by_name(res_pkt->name, cfg);
+		if (!res) {
+			log_error("error: can not find resource %s", res_pkt->name);
+			return -ECMD_NO_RESOURCE;
+		}
+
+		ret = get_bwr_info(res, cfg,
+				   &data_len, &meta_offset, &dbm_offset, &dbm_size,
+				   &bwr_offset, &bwr_disk_size);
+		if (ret < 0)
+			return -ECMD_GET_BWRINFO;
+
 		res_pkt->data_len = data_len;
 		res_pkt->meta_offset = meta_offset;
 		res_pkt->dbm_offset = dbm_offset;
 		res_pkt->dbm_size = dbm_size;
 		res_pkt->bwr_offset = bwr_offset;
 		res_pkt->bwr_disk_size = bwr_disk_size;
+	}
 
-                res_pkt = (struct res_conf_packet *)(res_pkt->data + res_pkt->runnode_num * sizeof(struct runnode_conf_packet));
-                res = find_res_by_name(res_pkt->name, cfg);
-        }
-
-        return 0;
+	return 0;
 }
 
-int get_res_path(struct res_config *res, struct config *cfg, int node_idx, char *dev_name, char *bwr_name)
+int get_res_path(struct res_config *res, int site_idx, char *dev_name, char *bwr_name)
 {
         int idx;
-        struct runnode_config *runnode;
+        struct runsite_config *runsite;
 
-        for (idx = 0; idx <= res->runnode_num; idx++)
+        for (idx = 0; idx <= res->runsite_num; idx++)
         {
-                runnode = &res->runnodes[idx];
-                if (node_idx == runnode->id)
+                runsite = &res->runsites[idx];
+                if (site_idx == runsite->id)
                 {
-                        strncpy(dev_name, runnode->disk, strlen(runnode->disk));
-                        strncpy(bwr_name, runnode->bwr_disk, strlen(runnode->bwr_disk));
+                        strncpy(dev_name, runsite->disk, strlen(runsite->disk));
+                        strncpy(bwr_name, runsite->bwr_disk, strlen(runsite->bwr_disk));
                         return 0;
                 }
         }
         return -1;
 }
 
-uint64_t get_bwr_size(uint64_t sectors)
+char *get_site_name(struct config *cfg, int site_id)
 {
-        return sectors * SECTOR_SIZE * (DATA_ALIGN - 1) / DATA_ALIGN;
+        int idx;
+        struct site_config *site;
+
+        for (idx = 0; idx < cfg->site_num; idx++) {
+                site = &cfg->sites[idx];
+                if (site_id == site->id)
+                        return site->sitename;
+        }
+        return NULL;
+}
+
+int get_res_site_proto(struct res_config *res, int site_id)
+{
+        int idx;
+        struct runsite_config *site;
+
+        for (idx = 0; idx < res->runsite_num; idx++) {
+                site = &res->runsites[idx];
+                if (site_id == site->id)
+			return site->proto;
+        }
+        return -1;
+}
+
+char *get_site_ip(struct config *cfg, int site_id)
+{
+        int idx;
+        struct site_config *site;
+
+        for (idx = 0; idx < cfg->site_num; idx++) {
+                site = &cfg->sites[idx];
+                if (site_id == site->id)
+                        return site->ipaddr;
+        }
+        return NULL;
 }
 
 int get_res_disk_size(struct res_config *res, struct config *cfg,
@@ -279,7 +378,7 @@ int get_res_disk_size(struct res_config *res, struct config *cfg,
         char dev_name[MAX_NAME_LEN] = {0};
         char bwr_name[MAX_NAME_LEN] = {0};
 
-        ret = get_res_path(res, cfg, cfg->local_node_id, dev_name, bwr_name);
+        ret = get_res_path(res, cfg->local_site_id, dev_name, bwr_name);
         if (ret < 0) {
                 log_error("error: can not find the resource path.");
                 return -ECMD_NO_PATH;
@@ -323,53 +422,14 @@ int get_disk_size(char *name, unsigned long *size)
         return ret;
 }
 
-int trim_nonlocal_res(struct config *cfg)
-{
-	int ridx, nidx, non_locals;
-	struct res_config *res, *res_iter;
-	struct runnode_config *node;
-	int i = 0;
-	int local_id;
-
-	non_locals = 0;
-	res = malloc(sizeof(struct res_config) * cfg->res_num);
-	if (res == NULL) {
-		log_error("error: not enough memory!");
-		return -1;
-	}
-	memset(res, 0, sizeof(struct res_config) * cfg->res_num);
-
-	local_id = cfg->nodes[cfg->local_node_id].id;
-	for (ridx = 0; ridx < cfg->res_num; ridx++) {
-		res_iter = &cfg->res[ridx];
-		for (nidx = 0; nidx < res_iter->runnode_num; nidx++) {
-			node = &res_iter->runnodes[nidx];
-			if (node->id == cfg->local_node_id)
-				break;
-		}
-
-		if (nidx < res_iter->runnode_num) {
-			memcpy(&res[i++], res_iter, sizeof(struct res_config));
-		}
-		else {
-			non_locals++;
-		}
-	}
-
-	free(cfg->res);
-	cfg->res = res;
-	cfg->res_num -= non_locals;
-	return 0;
-}
-
 int get_primary_id(struct packet *pkt)
 {
         int idx;
-        struct node_state_packet *node_state_pkt, *iter;
+        struct site_state_packet *site_state_pkt, *iter;
 
-        node_state_pkt = (struct node_state_packet *)(pkt->data);
-        for (idx = 0; idx < pkt->node_state_num; idx++) {
-                iter = &node_state_pkt[idx];
+        site_state_pkt = (struct site_state_packet *)(pkt->data);
+        for (idx = 0; idx < pkt->site_state_num; idx++) {
+                iter = &site_state_pkt[idx];
                 if (iter->role == R_PRIMARY) {
                         return iter->id;
                         break;
@@ -379,62 +439,76 @@ int get_primary_id(struct packet *pkt)
         return -1;
 }
 
-struct node_state_packet *get_node_state(struct packet *pkt, int id)
+struct site_state_packet *get_site_state(struct packet *pkt, int id)
 {
         int idx;
-        struct node_state_packet *node_state_pkt;
+        struct site_state_packet *site_state_pkt;
 
-        node_state_pkt = (struct node_state_packet *)(pkt->data);
-        for (idx = 0; idx < pkt->node_state_num; idx++) {
-                if (node_state_pkt[idx].id == id) {
-                        return &node_state_pkt[idx];
+        site_state_pkt = (struct site_state_packet *)(pkt->data);
+        for (idx = 0; idx < pkt->site_state_num; idx++) {
+                if (site_state_pkt[idx].id == id) {
+                        return &site_state_pkt[idx];
                 }
         }
 
         return NULL;
 }
 
-int node_belong_res(struct node_config *node, struct res_config * res)
+struct site_config *find_site(struct config *cfg, char *argv[])
+{
+        int type;
+
+        type = argv[1] ? atoi(argv[1]) : 0;
+
+        switch(type) {
+                case 0:
+                        return find_site_by_id(cfg, atoi(argv[0]));
+                case 1:
+                        return find_site_by_name(cfg, argv[0]);
+                case 2:
+                        return find_site_by_ip(cfg, argv[0]);
+                default:
+                        return NULL;
+        }
+}
+
+struct site_config *find_site_by_id(struct config *cfg, int id)
 {
         int idx;
 
-        for (idx = 0; idx < res->runnode_num; idx++) {
-                if (res->runnodes[idx].id == node->id)
-                        return 1;
+        for (idx = 0; idx < cfg->site_num; idx++) {
+                if (cfg->sites[idx].id == id)
+                        return &cfg->sites[idx];
         }
 
-        return 0;
+        return NULL;
 }
 
-int server_belong_res(struct config *cfg, struct server_config *server, struct res_config *res)
+/* Right now, site have no name in config file. */
+struct site_config *find_site_by_name(struct config *cfg, char *sitename)
 {
-	int idx;
-	struct node_config *node;
-	for (idx = 0; idx < res->runnode_num; idx++) {
-		node = find_node_by_id(cfg, res->runnodes[idx].id);
-		if(node && node->server_id == server->id) {
-			return 1;
-		}
-
-        }
-	return 0;
-
-
-
+        return NULL;
 }
 
-int check_splitbrain(struct packet *pkt)
+struct site_config *find_site_by_ip(struct config *cfg, char *ip)
 {
         int idx;
-        struct node_state_packet *node_state_pkt, *iter;
 
-        node_state_pkt = (struct node_state_packet *)(pkt->data);
-        for (idx = 0; idx < pkt->node_state_num; idx++) {
-                iter = &node_state_pkt[idx];
-                if (iter->c_state == C_SPLITBRAIN) {
+        for (idx = 0; idx < cfg->site_num; idx++) {
+                if (strncmp(cfg->sites[idx].ipaddr, ip, strlen(cfg->sites[idx].ipaddr)) == 0)
+                        return &cfg->sites[idx];
+        }
+
+        return NULL;
+}
+
+int site_belong_res(struct site_config *node, struct res_config * res)
+{
+        int idx;
+
+        for (idx = 0; idx < res->runsite_num; idx++) {
+                if (res->runsites[idx].id == node->id)
                         return 1;
-                        break;
-                }
         }
 
         return 0;
@@ -442,9 +516,9 @@ int check_splitbrain(struct packet *pkt)
 
 int check_device_up(struct  packet *pkt, struct config *cfg)
 {
-        struct node_state_packet *state_pkt;
+        struct site_state_packet *state_pkt;
 
-        state_pkt = get_node_state(pkt, cfg->local_server_idx);
+        state_pkt = get_site_state(pkt, cfg->local_site_id);
         if (!state_pkt) {
                 return 0;
         }
@@ -503,31 +577,6 @@ int bits(void *addr, uint64_t size)
         return nr;
 }
 
-void pr_dbm_cnt(void *start, uint64_t size)
-{
-        printf(" %d ", bits(start, size));
-}
-
-void pr_bwr_meta_info(char *addr)
-{
-        int i;
-        struct bwr_data_meta *meta;
-        char md5[33];
-
-        meta = (struct bwr_data_meta *)addr;
-	printf("%-*s:%lu\n"
-			"%-*s:%lu\n"
-			"%-*s:%lu\n"
-			"%-*s:%lu\n"
-			"%-*s:%lu\n",
-			12, "uuid",meta->uuid,
-			12, "bwr_seq",meta->bwr_seq,
-			12, "bwr_sector",meta->bwr_sector,
-			12, "dev_sector",meta->dev_sector,
-			12, "checksum",meta->checksum);
-
-}
-
 void pr_meta_info(char *addr)
 {
         int i;
@@ -565,8 +614,8 @@ int show_packet(struct config *cfg, struct res_config *res, struct packet *pkt)
 	uint64_t bwr_seq;
 	uint64_t tail, node_head, snd_head;
         uint64_t disk_size, bwr_disk_size;
-        struct node_state_packet *node_state_pkt;
-        struct node_state_packet *iter;
+        struct site_state_packet *site_state_pkt;
+        struct site_state_packet *iter;
         char dev_name[MAX_NAME_LEN] = {0};
         char bwr_name[MAX_NAME_LEN] = {0};
         char node_name[MAX_NAME_LEN] = {0};
@@ -579,27 +628,27 @@ int show_packet(struct config *cfg, struct res_config *res, struct packet *pkt)
 
 	uuid = pkt->uuid;
 	bwr_seq = pkt->bwr_seq;
-        node_state_pkt = (struct node_state_packet *)(pkt->data);
+        site_state_pkt = (struct site_state_packet *)(pkt->data);
         printf("HA Disk Mirroring Device: %s\n", res->name);
-        for (idx = 0; idx < pkt->node_state_num; idx++) {
-                iter = &node_state_pkt[idx];
+        for (idx = 0; idx < pkt->site_state_num; idx++) {
+                iter = &site_state_pkt[idx];
                 if (primary_idx < 0) {
 			if (iter->role == R_PRIMARY) {
 				primary_idx = idx;
 				idx = -1;
-			} else if (idx == pkt->node_state_num - 1 && !idx) {
-				primary_idx = pkt->node_state_num;
+			} else if (idx == pkt->site_state_num - 1 && !idx) {
+				primary_idx = pkt->site_state_num;
 				idx = -1;
 			}
 			continue;
 		}
-                iter = &node_state_pkt[(idx + primary_idx) % pkt->node_state_num];
-		ret = get_res_path(res, cfg, iter->kmod_id, dev_name, bwr_name);
+                iter = &site_state_pkt[(idx + primary_idx) % pkt->site_state_num];
+		ret = get_res_path(res, iter->id, dev_name, bwr_name);
 		tail = iter->tail;
 
 		if (!idx) {
-			if (primary_idx == pkt->node_state_num) {
-				if (iter->id != cfg->local_server_idx) {
+			if (primary_idx == pkt->site_state_num) {
+				if (iter->id != cfg->local_site_id) {
 					log_error("error: Not local status packet(no primary).");
 					return -ECMD_NO_STATE;
 				}
@@ -607,9 +656,8 @@ int show_packet(struct config *cfg, struct res_config *res, struct packet *pkt)
 			} else
 				printf("Primary:\n");
 			printf(PRI_STATE_FMT,
-					NODE_STATE_FMT_LEN, "Host Name", get_node_name(cfg, iter->kmod_id),
-					NODE_STATE_FMT_LEN, "Node ID", iter->id,
-					NODE_STATE_FMT_LEN, "Host IP", get_server_ip(cfg, iter->id),
+					NODE_STATE_FMT_LEN, "Host Name", get_site_name(cfg, iter->id),
+					NODE_STATE_FMT_LEN, "Host IP", get_site_ip(cfg, iter->id),
 					NODE_STATE_FMT_LEN, "Dev Name", res->name,
 					NODE_STATE_FMT_LEN, "UUID", uuid,
 					NODE_STATE_FMT_LEN, "Seq ID", bwr_seq,
@@ -621,23 +669,22 @@ int show_packet(struct config *cfg, struct res_config *res, struct packet *pkt)
 					NODE_STATE_FMT_LEN, "Bdev Size", disk_size,
 					NODE_STATE_FMT_LEN, "BWR Dev", bwr_name,
 					NODE_STATE_FMT_LEN, "BWR Size", bwr_disk_size,
-					NODE_STATE_FMT_LEN, "Total Secondary", pkt->node_state_num - 1);
+					NODE_STATE_FMT_LEN, "Total Secondary", pkt->site_state_num - 1);
 			continue;
 		}
 
 		printf("Secondary:\n");
                 printf(SECON_STATE_FMT,
-                                NODE_STATE_FMT_LEN, "Host Name", get_node_name(cfg, iter->kmod_id),
-				NODE_STATE_FMT_LEN, "Node ID", iter->id,
-                                NODE_STATE_FMT_LEN, "Host IP", get_server_ip(cfg, iter->id),
+                                NODE_STATE_FMT_LEN, "Host Name", get_site_name(cfg, iter->id),
+                                NODE_STATE_FMT_LEN, "Host IP", get_site_ip(cfg, iter->id),
 				NODE_STATE_FMT_LEN, "Replication Mode",
-				proto_name[iter->protocol],proto_name[get_res_node_proto(res, iter->id)],
+				proto_name[iter->protocol],proto_name[get_res_site_proto(res, iter->id)],
                                 NODE_STATE_FMT_LEN, "Disk Status", dstate_name[iter->data_state != DATA_CONSISTENT],
                                 NODE_STATE_FMT_LEN, "Data Status", datastate_name[iter->data_state],
                                 NODE_STATE_FMT_LEN, "Replication Status", cstate_name[iter->c_state],
                                 NODE_STATE_FMT_LEN, "Replication Speed", 0LLU,
 				NODE_STATE_FMT_LEN, "Network Status", nstate_name[iter->n_state],
-				NODE_STATE_FMT_LEN, "BWR Behind", (unsigned long long)NO_LESS_SUB(tail, iter->node_head),
+				NODE_STATE_FMT_LEN, "BWR Behind", (unsigned long long)NO_LESS_SUB(tail, iter->site_head),
 				NODE_STATE_FMT_LEN, "Dbm", iter->dbm_set,
 				NODE_STATE_FMT_LEN, "Time Distance", 0LLU);
 
@@ -653,7 +700,95 @@ char *md5_print(char *out, uint8_t *in)
 	return out;
 }
 
-void daemonize()
+void pr_config(struct config *cfg)
 {
-	daemon(0, 0);
+	int i;
+
+	pr_global_config(cfg);
+
+	printf("\n");
+	printf("Total sites: %d\n", cfg->site_num);
+	for (i = 0; i < cfg->site_num; i++)
+		pr_site_config(&cfg->sites[i]);
+	printf("\tlocal_site_id: %d\n", cfg->local_site_id);
+
+	printf("\n");
+	printf("Total resources: %d\n", cfg->res_num);
+	for (i = 0; i < cfg->res_num; i++)
+		pr_res_config(&cfg->res[i]);
+}
+
+void pr_global_config(struct config *cfg)
+{
+	printf("server ip: %s\n", cfg->serverip);
+	printf("server port: %s\n", cfg->serverport);
+	printf("kmodport: %s\n", cfg->kmodport);
+	printf("server maxpingcount: %d\n", cfg->maxpingcount);
+	printf("server pingtimeout: %d\n", cfg->pingtimeout);
+}
+
+void pr_site_config(struct site_config *site)
+{
+	int i;
+
+	printf("\tid: %d\n", site->id);
+	printf("\tname: %s\n", site->sitename);
+	printf("\tmode: %d\n", site->mode);
+	printf("\tip: %s\n", site->ipaddr);
+	printf("\tport: %s\n", site->port);
+
+	printf("\tTotal %d nodes in site:\n", site->node_num);
+	for (i = 0; i < site->node_num; i++) {
+		pr_node_config(&site->nodes[i]);
+		printf("\n");
+	}
+}
+
+void pr_node_config(struct node_config *node)
+{
+	printf("\t\tid: %d\n", node->id);
+	printf("\t\thostname: %s\n", node->hostname);
+	printf("\t\tip: %s\n", node->ipaddr);
+	printf("\t\tport: %s\n", node->port);
+}
+
+void pr_res_config(struct res_config *res_config)
+{
+	int i;
+
+	printf("\tid: %d\n", res_config->id);
+	printf("\tname: %s\n", res_config->name);
+	printf("\tdatalen: %lu\n", res_config->data_len);
+	printf("\tdbm_offset: %lu\n", res_config->dbm_offset);
+	printf("\tdbm_size: %lu\n", res_config->dbm_size);
+
+	printf("\tTotal runsite%s: %d\n", res_config->runsite_num > 0 ? "s" : "", res_config->runsite_num);
+	for (i = 0; i < res_config->runsite_num; i++)
+		pr_runsite_config(&res_config->runsites[i]);
+}
+
+void pr_runsite_config(struct runsite_config *runsite_config)
+{
+	int i;
+
+	printf("\t\tid: %d\n", runsite_config->id);
+	printf("\t\tproto: %s\n", runsite_config->proto ? "ASYNC" : "SYNC");
+	printf("\t\tipaddr: %s\n", runsite_config->ipaddr);
+	printf("\t\tport: %s\n", runsite_config->port);
+	printf("\t\tdisk: %s\n", runsite_config->disk);
+	printf("\t\tbwr_disk: %s\n", runsite_config->bwr_disk);
+	printf("\t\trunnode_num: %d\n", runsite_config->runnode_num);
+
+	for (i = 0; i < runsite_config->runnode_num; i++) {
+		pr_runnode_config(&runsite_config->runnodes[i]);
+		printf("\n");
+	}
+}
+
+void pr_runnode_config(struct node_config *node)
+{
+	printf("\t\t\tid: %d\n", node->id);
+	printf("\t\t\thostname: %s\n", node->hostname);
+	printf("\t\t\tip: %s\n", node->ipaddr);
+	printf("\t\t\tport: %s\n", node->port);
 }

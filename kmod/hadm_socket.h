@@ -16,7 +16,7 @@ enum {
 	NET_CONNECTED = 0,
 	NET_DISCONNECTED = 1,
 	NET_WAIT_CONNECT = 2,
-	NET_CLOSED = 3
+	NET_CLOSED,
 };
 
 struct hadm_net {
@@ -33,28 +33,20 @@ struct hadm_net {
 
 };
 
-#ifdef NET_DEBUG
-#define __hadm_net_set_state(net, state) do { \
-	pr_info("%s: set net %p 's state from %d to %d\n",  __FUNCTION__, net,  net->cstate , state); \
-	net->cstate = state; \
-	}while(0)
-#else 
-#define __hadm_net_set_state(net, state) do { \
-	net->cstate = state; \
-	}while(0)
-#endif
-
 extern int hadm_socket_set_timeout(struct socket *sock,int timeout);
 extern struct socket *hadm_socket_connect(char *ip, uint16_t port);
 extern struct socket *hadm_socket_listen(uint16_t port);
 extern int hadm_socket_send(struct socket *sock, void *data, size_t size);
+extern int hadm_socket_receive(struct socket *c_sock, char *buf, size_t buflen);
+extern int hadm_socket_sendv(struct socket *sock, struct kvec *vec, int count,
+		int size);
+extern int hadm_socket_recvv(struct socket *sock, struct kvec *vec, int count,
+		size_t size);
+
 extern void hadm_socket_close(struct socket *sock);
 extern void hadm_socket_release(struct socket *sock);
-extern int hadm_socket_receive(struct socket *c_sock, char *buf, size_t buflen);
-extern int hadm_net_closed(struct hadm_net *net);
-extern int hadm_net_connected(struct hadm_net *net);
 
-extern struct hadm_net *hadm_net_create(const char *ipaddr, const int port, int gfp_mask);
+extern struct hadm_net *hadm_net_create(int gfp_mask);
 extern void hadm_net_shutdown(struct hadm_net *net, enum sock_shutdown_cmd how);
 extern void hadm_net_close(struct hadm_net *net);
 extern void hadm_net_release(struct hadm_net *net);
@@ -64,23 +56,8 @@ extern int hadm_net_receive(struct hadm_net *net, char *buf, size_t buflen);
 extern struct hadm_net *find_hadm_net_by_type(int type);
 
 extern int hadm_socket_has_connected(struct hadm_net *net);
+extern int hadm_net_closed(struct hadm_net *net);
 extern int hadm_connect_server(void *arg);
-
-static inline int hadm_net_get_state(struct hadm_net *net)
-{
-	int cstate;
-	if(IS_ERR_OR_NULL(net)) {
-		return NET_CLOSED;
-	}
-	mutex_lock(&net->cstate_lock);
-	cstate = net->cstate ; 
-	if(cstate != NET_CLOSED && IS_ERR_OR_NULL(net->sock)){
-		cstate = NET_DISCONNECTED;
-	}
-	mutex_unlock(&net->cstate_lock);
-	return cstate;
-}
-
 
 static inline void hadm_net_set_socket(struct hadm_net *net, struct socket *sock)
 {
@@ -120,16 +97,13 @@ static inline int get_hadm_net_socket(struct hadm_net *net)
 static inline void hadm_net_close_socket(struct hadm_net *net)
 {
 	mutex_lock(&net->cstate_lock);
-	if(net->cstate != NET_CLOSED) {
-		__hadm_net_set_state(net, NET_DISCONNECTED);
-		BUG_ON(!atomic_read(&net->refcnt));
-		if(net->sock) {
-			if (atomic_dec_and_test(&net->refcnt)) {
-				hadm_socket_close(net->sock);
-				hadm_socket_release(net->sock);
-				net->sock = NULL;
-			}
-		}
+	if (net->cstate == NET_CONNECTED)
+		net->cstate = NET_DISCONNECTED;
+	hadm_socket_close(net->sock);
+	BUG_ON(!atomic_read(&net->refcnt));
+	if (atomic_dec_and_test(&net->refcnt)) {
+		hadm_socket_release(net->sock);
+		net->sock = NULL;
 	}
 	mutex_unlock(&net->cstate_lock);
 }

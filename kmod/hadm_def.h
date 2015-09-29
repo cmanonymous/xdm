@@ -16,6 +16,8 @@
 #  define PREFIX "/opt/hadm"
 #endif
 
+#define HADM_CONF_PATH PREFIX "/etc/hadm_conf.xml"
+
 #define MAX_NODES 32
 #define MAX_DEVICES 255
 
@@ -38,13 +40,11 @@
 
 #define PACKET_LEN 4096
 
+#define DATA_PORT 9998
 #define MAX_IP_SIZE 16
 #define MAX_PATH_SIZE 128
-#define MAX_BIO_QUEUE_SIZE (1<<14)
+#define MAX_BIO_QUEUE_SIZE (1<<3)
 
-#define INVALID_LOCAL_ID (-1)
-#define DEFAULT_SERVER_IPADDR "127.0.0.1"
-#define DEFAULT_SERVER_PORT 9998
 #define DEFAULT_CMD_RECV_PORT 9997
 #define RECEIVER_TIMEOUT 3000	/* millisecond */
 
@@ -64,9 +64,14 @@
 #define round_down(x,y) ((x) & ~__round_mask(x,y))
 #endif
 
+#ifndef div_round_up
+#define div_round_up(x, y) (((x) - 1) / (y) + 1)
+#endif
+
 #ifndef pr_warn
 #define pr_warn	pr_warning
 #endif
+
 #ifdef DEBUG_IO
 #define IO_DEBUG(...) \
 	do { printk(__VA_ARGS__); } while (0)

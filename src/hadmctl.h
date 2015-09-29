@@ -15,6 +15,6 @@ int connect_to_kern(struct config *cfg);
 
 int do_command(int fd, int argc, char *argv[], struct config *cfg);
 
-int get_status(struct config *cfg, struct res_config *res, struct packet **pkt);
+int get_status(int conn_fd, struct config *cfg, struct res_config *res, struct packet **pkt);
 
 #endif // __HADMCTL_H__

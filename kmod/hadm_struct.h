@@ -5,14 +5,14 @@
 #include <linux/spinlock.h>
 
 struct hadmdev;
-struct hadm_node;
+struct hadm_site;
 struct receiver_thread;
 struct sender_thread;
 struct cmd_worker_thread;
 
 struct hadm_struct {
-	int local_node_id;	//proxy server id
-	int local_kmod_id;	//local node kmod id
+	int local_site_id;
+	int local_node_id;
 	int major;
 	int state;
 
@@ -30,32 +30,23 @@ struct hadm_struct {
 	struct hadm_thread *p_receiver[P_TYPE_NUM];
 	struct hadm_thread *p_sender[P_TYPE_NUM];
 	struct hadm_queue *cmd_receiver_queue;
-	struct hadm_queue *cmd_sender_queue;
-	atomic_t sender_queue_size[P_TYPE_NUM];
-	wait_queue_head_t queue_event;
+	struct hadm_queue *p_sender_queue[P_TYPE_NUM];
 
 	struct proc_dir_entry *proc_dir;
 };
 
 extern struct hadm_struct *g_hadm;
 
-extern struct hadm_struct *hadm_alloc(const char *hadm_server_ipaddr,
-				      const int hadm_server_port, int gfp_mask);
+extern struct hadm_struct *hadm_alloc(int gfp_mask);
 extern void hadm_put(struct hadm_struct *hadm);
-extern int hadm_init(struct hadm_struct *hadm, const int hadm_local_id,
-		     const int hadm_cmd_port, int gfp_mask);
-extern int hadm_reconfig(struct hadm_struct *hadm, char *serverip, char *serverport,
-		int local_node_id, int local_kmod_id);
-
-static inline int get_kmod_id(void)
-{
-	return g_hadm->local_kmod_id;
-}
+extern int hadm_init(struct hadm_struct *hadm, const char *path, const int port, int gfp_mask);
 
 extern void hadm_list_add(struct hadm_struct *hadm, struct hadmdev *dev);
 extern void hadm_list_del(struct hadm_struct *hadm, struct hadmdev *dev);
-extern int hadm_devs_empty(struct hadm_struct *hadm);
+extern void hadm_disconnect(struct hadm_struct *hadm);
 extern int hadm_get_config_count(struct hadm_struct *hadm);
 extern void hadm_inc_config_count(struct hadm_struct *hadm);
+
+extern struct hadm_queue *hadm_get_queue(struct hadm_struct *hadm, int type);
 
 #endif	/* HADM_H */

@@ -13,7 +13,9 @@ extern void primary_info__set_id(struct primary_info *info, uint8_t id);
 extern void primary_info__set_uuid(struct primary_info *info, uint64_t uuid);
 extern void primary_info__set_bwrseq(struct primary_info *info, uint64_t seq);
 extern int set_local_primary(struct hadmdev *dev, uint32_t node_id, uint64_t uuid);
+extern int set_last_primary(struct hadmdev *dev, int dstate, uint32_t node_id, uint64_t uuid, uint64_t seq,
+		uint64_t disk_sector, uint8_t md5[]);
 extern int get_last_primary(struct hadmdev *dev);
-extern int check_split_brain(struct bwr_meta *local, struct bwr_meta *remote);
+extern int check_split_brain(struct bwr_meta *local_site, struct bwr_meta *remote);
 
 #endif	/* PRIMARY_INFO_H */

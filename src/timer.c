@@ -14,7 +14,7 @@ struct timer *alloc_timer()
 	return timer;
 }
 
-struct timer *create_timer(int timeout, event_handler timer_handler, void *data)
+struct timer *create_timer(char *name, int timeout, event_handler timer_handler, void *data)
 {
 	struct timer *timer;
 
@@ -23,9 +23,14 @@ struct timer *create_timer(int timeout, event_handler timer_handler, void *data)
 		return NULL;
 	}
 
+	snprintf(timer->name, sizeof(timer->name), "%s", name);
 	timer->timeout.tv_sec = timeout;
 	timer->timer_handler = timer_handler;
 	timer->data = data;
+
+	log_info("create timer %s, timeout: %d second%s",
+		 timer->name, timer->timeout.tv_sec,
+		 timer->timeout.tv_sec > 1 ? "s" : "");
 
 	return timer;
 }

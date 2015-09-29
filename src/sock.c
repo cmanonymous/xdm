@@ -83,7 +83,12 @@ int sock_accept(int fd, struct sockaddr *addr, socklen_t *addrlen)
 
 int sock_connect(int fd, struct sockaddr *addr)
 {
-	return connect(fd, addr, sizeof(struct sockaddr));
+	int ret;
+
+	ret = connect(fd, addr, sizeof(struct sockaddr));
+	if (ret < 0)
+		ret = -errno;
+	return ret;
 }
 
 int sock_read(int fd, void *buf, size_t size)
@@ -100,16 +105,18 @@ int sock_get_addr(const char *ip, const char *port, struct sockaddr *addr)
 {
 	struct addrinfo *res;
 	struct addrinfo hints;
-	int ret = 0; 
 
 	memset(&hints, 0, sizeof(struct addrinfo));
 	hints.ai_family = AF_INET;
 	hints.ai_socktype = SOCK_STREAM;
-	ret = getaddrinfo(ip, port, &hints, &res);
-	if(!ret)
-		memcpy(addr, res->ai_addr, sizeof(struct sockaddr));
-	freeaddrinfo(res);
-	return ret;
+
+	if(getaddrinfo(ip, port, &hints, &res) < 0) {
+		return -1;
+	}
+
+	memcpy(addr, res->ai_addr, sizeof(struct sockaddr));
+
+	return 0;
 }
 
 int sock_server_create(struct sockaddr *addr)

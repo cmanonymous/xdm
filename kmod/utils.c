@@ -1,16 +1,5 @@
 #include "utils.h"
 
-struct node_config *get_node_by_id(int id, struct config *cfg)
-{
-        int idx;
-
-        for (idx = 0; idx < cfg->node_num; idx++) {
-                if (cfg->nodes[idx].id == id)
-                        return &cfg->nodes[idx];
-        }
-
-        return NULL;
-}
 
 uint64_t get_disk_size(struct dbm *dbm)
 {

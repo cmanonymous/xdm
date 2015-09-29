@@ -10,7 +10,7 @@ struct hadm_show_func {
 
 extern int hadm_proc_show(struct seq_file *seq, void *v);
 extern int bwr_anchor_show(struct seq_file *seq, void *v);
-extern int bio_queue_show(struct seq_file *seq, void *v);
-extern int bwr_info_show(struct seq_file *seq, void *v) ;
+extern int site_status_show(struct seq_file *seq, void *v);
+extern int node_status_show(struct seq_file *seq, void *v);
 
 #endif /* __HADM_PROC_SHOW_H__ */

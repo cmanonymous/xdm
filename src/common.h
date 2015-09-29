@@ -28,7 +28,6 @@
 
 #define MODULE_FILE "/proc/modules"
 #define MODULE_NAME "hadm_kmod"
-#define MODULE_PATH "/opt/hadm/kmod/hadm_kmod.ko"
 
 #define HADM_LOG_CONF SYSCONFDIR "/hadm_log.conf"
 #define HADM_SERVER_LOG_CAT "hadm_server_cat"
@@ -59,11 +58,11 @@ enum {
 	NODE_MFD_CONNECTED
 };
 
-static char *connect_state[] = {
-	[NODE_DFD_DISCONNECTED] = "disconnect",
-	[NODE_DFD_CONNECTED] = "connect",
-	[NODE_MFD_DISCONNECTED] = "disconnect",
-	[NODE_MFD_CONNECTED] = "connect",
+static const char *link_state_name[] = {
+	[NODE_DFD_DISCONNECTED] = "NODE_DFD_DISCONNECTED",
+	[NODE_DFD_CONNECTED] = "NODE_DFD_CONNECTED",
+	[NODE_MFD_DISCONNECTED] = "NODE_MFD_DISCONNECTED",
+	[NODE_MFD_CONNECTED] = "NODE_MFD_CONNECTED",
 };
 
 enum {
@@ -71,6 +70,13 @@ enum {
 	DATA_HANDSHAKE_ACK,
 	META_HANDSHAKE,
 	META_HANDSHAKE_ACK
+};
+
+static const char *link_handshake_name[] = {
+	[DATA_HANDSHAKE] = "DATA_HANDSHAKE",
+	[DATA_HANDSHAKE_ACK] = "DATA_HANDSHAKE_ACK",
+	[META_HANDSHAKE] = "META_HANDSHAKE",
+	[META_HANDSHAKE_ACK] = "META_HANDSHAKE_ACK",
 };
 
 #include "common.inc"
@@ -84,6 +90,8 @@ enum {
 #include "conf.h"
 #include "packet.h"
 #include "daemon.h"
+#include "ip.h"
+#include "resource.h"
 #include "device.h"
 #include "io.h"
 #include "node_worker.h"
@@ -96,6 +104,5 @@ enum {
 #include "utils.h"
 #include "hadmcmd.h"
 #include "hadmctl.h"
-#include "ip.h"
 
 #endif // __COMMON_H__

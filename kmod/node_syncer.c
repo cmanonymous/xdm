@@ -10,7 +10,7 @@
 #include "hadm_config.h"
 #include "hadm_struct.h"
 #include "hadm_device.h"
-#include "hadm_node.h"
+#include "hadm_site.h"
 #include "hadm_packet.h"
 #include "hadm_thread.h"
 
@@ -33,14 +33,19 @@ void sync_write_endio(struct bio *bio, int err)
 		bwr_data = (struct bwr_data *)page_private(bio->bi_io_vec[0].bv_page);
 		count = buffer_inuse_del(bwr->hadmdev->buffer, bwr_data);
 		if (count < 0) {
-			pr_err("local sync error.\n");
-			hadmdev_set_error(bwr->hadmdev, __BDEV_ERR);
+			pr_err("local_site sync error.\n");
+			dump_buffer_inuse(bwr->hadmdev->buffer);
+			dump_buffer_data(bwr->hadmdev->buffer);
+			hadmdev_set_error(bwr->hadmdev);
+			//BUG();
 		}
 		if (count > 0)
-			bwr_node_head_add(bwr, get_node_id(), count);
+			bwr_site_head_add(bwr, get_site_id(), count);
+		IO_DEBUG("sync bwr_data %llu(%lu:%lu) finished.\n",
+				bwr_data->meta.bwr_seq, bwr_data->meta.bwr_sector,
+				bwr_data->meta.dev_sector);
 	} else {
 		pr_err("%s io error %d.", __FUNCTION__, err);
-		hadmdev_set_error(bwr->hadmdev, __BDEV_ERR);
 	}
 
 	bio_put(bio);
@@ -51,9 +56,10 @@ int sync_local_bwrdata(struct bwr *bwr, struct bwr_data *bwr_data)
 	struct bio *wbio;
 	struct hadmdev *dev;
 	DECLARE_COMPLETION_ONSTACK(compl);
-	char *addr;
 
-	addr = page_address(bwr_data->data_page);
+	IO_DEBUG("local_site try sync data: %llu(%lu:%lu).\n",
+			bwr_data->meta.bwr_seq,
+			bwr_data->meta.bwr_sector, bwr_data->meta.dev_sector);
 	dev = bwr->hadmdev;
 	wbio = bio_alloc(GFP_KERNEL, 1);
 	if (wbio == NULL) {
@@ -78,34 +84,20 @@ err_wbio:
 	return -1;
 }
 
-#define META_FLUSH_INVL 1
 int sync_local_thread(void *arg)
 {
 	struct hadmdev *dev = arg;
 	struct bwr_data *prev_data = NULL;
 	struct bwr_data *snd_head_data = NULL;
-	struct hadm_thread *thread = dev->worker_thread[LOCAL_SYNC_HANDLER];
-	unsigned long last_meta_flush_time = jiffies;
+	struct hadm_thread *thread = dev->threads[LOCAL_SYNC_HANDLER];
 
 	pr_info("sync_local_thread is running\n");
 	while (hadm_thread_get_state(thread) == HADM_THREAD_RUN) {
-		if(hadmdev_error(dev)){
-			msleep(2000);
-			continue;
-		}
-
-		/**
-		 *之所以在这里sync_disk_meta，是因为primary/secondary都要定时更新meta
-		 *而secondary只启动sync_local_thread
-		 */
-		//FIXME secondary也操作buffer，因此该函数的无锁实现可能需要重新设计
-		if(time_before(last_meta_flush_time + META_FLUSH_INVL * HZ, jiffies)) {
-			sync_disk_meta(dev->bwr);
-			last_meta_flush_time = jiffies;
-		}
 		if (down_timeout(&dev->buffer->data_sema, msecs_to_jiffies(100)) == -ETIME) {
 			continue;
 		}
+
+		//msleep(3000);
 		if (unlikely(!prev_data))
 			snd_head_data = dev->buffer->inuse_head;
 		else {
@@ -114,9 +106,9 @@ int sync_local_thread(void *arg)
 				snd_head_data = dev->buffer->inuse_head;
 			bwr_data_put(prev_data);
 		}
-		if(IS_ERR_OR_NULL(snd_head_data)) {
-			continue;
-		}
+		IO_DEBUG("get send_head_data: %llu(%lu:%lu). prev:%llu\n",
+				bwr_data_seq(snd_head_data), snd_head_data->meta.bwr_sector, snd_head_data->meta.dev_sector,
+				prev_data ? bwr_data_seq(prev_data) : 0);
 		bwr_data_get(snd_head_data);
 		prev_data = snd_head_data;
 		sync_local_bwrdata(dev->bwr, snd_head_data);
@@ -125,7 +117,7 @@ int sync_local_thread(void *arg)
 	if (prev_data)
 		bwr_data_put(prev_data);
 	/* thread exit */
-	hadm_thread_terminate(thread);
+	complete(&thread->ev_exit);
 	return 0;
 }
 
@@ -134,79 +126,37 @@ int sync_remote_thread(void *arg)
 {
 	struct hadmdev *dev = arg;
 	struct bwr *bwr = dev->bwr;
-	struct hadm_node *runnode;
+	struct hadm_site *runsite;
 	struct bwr_data *bwr_data;
-	int online_secondary = 0;
-	int node_disconnected = 0 ;
-	int pack_sent, cstate, data_state, dstate, local_node_id;
-	struct hadm_thread *thread=dev->worker_thread[REMOTE_SYNC_HANDLER];
-	unsigned long flags;
-	sector_t last_seq[MAX_NODES] = {0} ;
+	int online_secondary=0;
+	int pack_sent, cstate, dstate, local_node_id;
+	struct hadm_thread *thread=dev->threads[REMOTE_SYNC_HANDLER];
 
 	pr_info("sync_remote_thread is running\n");
 
-	local_node_id = get_node_id();
-	//memset((void *)last_seq, 0, sizeof(sector_t) * MAX_NODES);
+	local_node_id = get_site_id();
 
 	init_completion(&bwr->have_snd_data);
 	while (hadm_thread_get_state(thread) == HADM_THREAD_RUN) {
 		pack_sent = 0;
 		online_secondary=0;
-		if(hadmdev_error(dev)){
-			msleep(2000);
-			continue;
-		}
-
-		list_for_each_entry(runnode, &dev->hadm_node_list, node) {
-			if (runnode->id == local_node_id)
+		list_for_each_entry(runsite, &dev->hadm_site_list, site) {
+			if (runsite->id == local_node_id)
 				continue;
-			node_disconnected = 0 ;
-			spin_lock_irqsave(&runnode->s_state.lock, flags);
-			cstate = __hadm_node_get(&runnode->s_state, S_CSTATE);
-			dstate = __hadm_node_get(&runnode->s_state, S_DSTATE);
-			data_state = __hadm_node_get(&runnode->s_state, S_DATA_STATE);
-			if(cstate != C_SYNC && runnode->conf.real_protocol == PROTO_SYNC) {
-				pr_info("node %d's trans protocol change from SYNC TO ASYNC when cstate is not C_SYNC\n", runnode->id);
-				runnode->conf.real_protocol = PROTO_ASYNC;
-				node_disconnected = 1; 
-			}
-			spin_unlock_irqrestore(&runnode->s_state.lock, flags);
-
-			if(node_disconnected) {
-				last_seq[runnode->id] = 0;
-				sync_mask_clear_after_node_disconnect(dev, runnode->id);
+			cstate = hadm_site_get(runsite, SECONDARY_STATE, S_CSTATE);
+			dstate = hadm_site_get(runsite, SECONDARY_STATE, S_DSTATE);
+			if (cstate != C_SYNC || dstate != D_CONSISTENT)
 				continue;
-			}
-
-			if (cstate != C_SYNC || dstate != D_CONSISTENT || data_state != DATA_CONSISTENT){
-				last_seq[runnode->id] = 0;
-				continue;
-			}
 			online_secondary++;
 
 			/* 当node数据发送完后，不发送 */
-			bwr_data = get_send_head_data(bwr, runnode->id, last_seq[runnode->id]);
+			bwr_data = get_send_head_data(bwr, runsite->id);
 			if (bwr_data == NULL)
 				continue;
 
-			IO_DEBUG("%s:get send head data (snd_head = %llu, head = %llu) for node %d, bwr_data = %p, bwr_seq = %llu\n", 
-					__FUNCTION__, 
-					(unsigned long long)hadm_node_get(runnode, SECONDARY_STATE, S_SND_HEAD), 
-					(unsigned long long)bwr_node_head(bwr, runnode->id),
-					runnode->id, bwr_data, bwr_data->meta.bwr_seq);
-			if(last_seq[runnode->id] && bwr_data->meta.bwr_seq != last_seq[runnode->id] + 1) {
-				pr_warn("%s: Bug occurs, sync node %d with unordered data. snd_head = %llu, last_seq = %llu, bwr_seq = %llu, bwr_data = %p.\n",
-						__FUNCTION__, runnode->id ,
-						(unsigned long long)hadm_node_get(runnode, SECONDARY_STATE, S_SND_HEAD), 
-						(unsigned long long)last_seq[runnode->id] ,
-						(unsigned long long)bwr_data->meta.bwr_seq, bwr_data);
-				bwr_dump(bwr);
-				BUG();
-			}
-			last_seq[runnode->id] = bwr_data->meta.bwr_seq ;
-			sync_node_bwrdata(runnode, bwr_data, P_DATA);
+			sync_site_bwrdata(runsite, bwr_data, P_SD_DATA);
 			bwr_data_put(bwr_data);
-			snd_head_condition_update(runnode, S_CSTATE, C_SYNC);
+			snd_head_condition_update(runsite, S_CSTATE, C_SYNC);
 			pack_sent++;
 		}
 
@@ -221,120 +171,80 @@ int sync_remote_thread(void *arg)
 	}
 
 	/* thread exit */
-	hadm_thread_terminate(thread);
+	complete(&thread->ev_exit);
 	return 0;
 }
 
 /* 写本地dbm */
+/* FIXME: dbm需要处理好并发、同步速度等问题，多个节点的情况下，
+ * 同步写会拖慢整体速度, 需要重新设计
+ */
 int sync_dbm_thread(void *arg)
 {
 	int ret;
 	struct hadmdev *dev = arg;
 	struct bwr *bwr = dev->bwr;
-	struct hadm_node *runnode;
+	struct hadm_site *runsite;
 	struct bwr_data *bwr_data;
-	int dbm_written, dstate , cstate;
+	int dbm_written, dstate, cstate;
 	unsigned long flags1, flags2;
 	sector_t snd_head;
-	sector_t last_seq[MAX_NODES];
-	struct hadm_thread *thread=dev->worker_thread[DBM_SYNC_HANDLER];
+	struct hadm_thread *thread=dev->threads[DBM_SYNC_HANDLER];
 
 	pr_info("sync dbm thread run.\n");
-	memset((void *)last_seq, 0, sizeof(sector_t) * MAX_NODES);
-
 	while (hadm_thread_get_state(thread) == HADM_THREAD_RUN) {
-		if(hadmdev_error(dev)){
-			msleep(2000);
-			continue;
-		}
 		dbm_written = 0;
-
-		list_for_each_entry(runnode, &dev->hadm_node_list, node) {
-			if(runnode->id==get_node_id())
+		list_for_each_entry(runsite, &dev->hadm_site_list, site) {
+			if(runsite->id==get_site_id())
 				continue;
-			cstate = hadm_node_get(runnode, SECONDARY_STATE, S_CSTATE);
-			dstate = hadm_node_get(runnode, SECONDARY_STATE, S_DSTATE);
+			cstate = hadm_site_get(runsite, SECONDARY_STATE, S_CSTATE);
+			dstate = hadm_site_get(runsite, SECONDARY_STATE, S_DSTATE);
 
 			/* sync data to dbm in memory */
-			/*
-			 *这里将检测d_state改成data_state，主要是因为如果收到对端的io错误的信息后，
-			 *会将对端的d_state改为D_FAIL，这时候是不应该触发写DBM的，只有当bwr满了之后
-			 *才会触发写DBM
-			 */
 			if (cstate == C_STOPPED && dstate != D_CONSISTENT){
-				if(!last_seq[runnode->id]){
-					IO_DEBUG("%s: start to write dbm for node %d, snd_head=%llu, dstate=%d\n",
-							__FUNCTION__, runnode->id, 
-							hadm_node_get(runnode, SECONDARY_STATE, S_SND_HEAD), dstate);
-				}
-
-				bwr_data = get_send_head_data(bwr, runnode->id, last_seq[runnode->id]);
+				bwr_data = get_send_head_data(bwr, runsite->id);
 				if(bwr_data){
 					/**set dbm/dbm_dbm bits in memory **/
-					last_seq[runnode->id] = bwr_data->meta.bwr_seq; 
-					dbm_set_sector(runnode->dbm,bwr_data->meta.dev_sector);
-					snd_head_condition_update(runnode, S_CSTATE, C_STOPPED);
+					dbm_set_sector(runsite->dbm,bwr_data->meta.dev_sector);
+					snd_head_condition_update(runsite, S_CSTATE, C_STOPPED);
 					dbm_written++;
 					bwr_data_put(bwr_data);
-					/**
-					pr_info("update_dbm:%d\t\t%llu\t\t%llu\t%llu\t\t%llu\t%llu\n",
-						runnode->id,
-						(unsigned long long)dev->bwr->mem_meta.tail, 
-						(unsigned long long)dev->bwr->mem_meta.head[runnode->id],
-						(unsigned long long)runnode->s_state.snd_head,
-						(unsigned long long)runnode->s_state.snd_ack_head,
-						(unsigned long long)last_seq[runnode->id]
-						);
-					**/
-
-
 				}
-			}else {
-				last_seq[runnode->id] = 0 ;
 			}
 
-			if(time_to_flush_dbm(runnode->dbm)) {
-
+			if(time_to_flush_dbm(runsite->dbm)) {
 				/*
 				 * flush dbm 到磁盘，当完成后，将head置为sndhead
 				 * 这个操作在delta_sync的时候也会进行，
 				 */
-				if (runnode->dbm->last_dirty_record) {
+				if (0 && runsite->dbm->last_dirty_record) {
 					//IO_DEBUG("nr_bit:%d, last_nr_bit:%d.\n",
 						//nr_bit, last_nr_bit);
-					ret = dbm_store(runnode->dbm);
+					snd_head = hadm_site_get(runsite, SECONDARY_STATE, S_SND_HEAD);
+					ret = dbm_store(runsite->dbm);
 					if (ret < 0) {
 						pr_err("sync bwr data faild.%d\n", ret);
-						hadmdev_set_error(dev, __BWR_ERR);
+						hadmdev_set_error(dev);
 						break;
+					} else if (ret > 0) {
+						/* require two lock:
+						 * node->s_state.lock
+						 *	bwr->lock
+						 */
+						spin_lock_irqsave(&runsite->s_state.lock, flags1);
+						dstate= __hadm_site_get(&runsite->s_state, S_DSTATE);
+						cstate= __hadm_site_get(&runsite->s_state, S_CSTATE);
+
+						if (dstate == D_INCONSISTENT && cstate== C_STOPPED) {
+							write_lock_irqsave(&bwr->lock, flags2);
+							__bwr_set_site_head(bwr, runsite->id, snd_head);
+							write_unlock_irqrestore(&bwr->lock, flags2);
+						}
+						spin_unlock_irqrestore(&runsite->s_state.lock, flags1);
 					}
 				}
-				/* require two lock:
-				 * node->s_state.lock
-				 *	bwr->lock
-				 */
-				spin_lock_irqsave(&runnode->s_state.lock, flags1);
-				snd_head = __hadm_node_get(&runnode->s_state, S_SND_HEAD);
-				dstate = __hadm_node_get(&runnode->s_state, S_DSTATE);
-				cstate = __hadm_node_get(&runnode->s_state, S_CSTATE);
-
-				if (dstate == D_INCONSISTENT && cstate== C_STOPPED) {
-					write_lock_irqsave(&bwr->lock, flags2);
-					__bwr_set_node_head(bwr, runnode->id, snd_head);
-					write_unlock_irqrestore(&bwr->lock, flags2);
-				}
-				spin_unlock_irqrestore(&runnode->s_state.lock, flags1);
-				set_last_flush_time(runnode->dbm);
-				/**
-				pr_info("time_to_flush_dbm(dstate:%s, cstate:%s):%d\t%llu\t%llu\t%llu\n",
-						dstate_name[dstate], cstate_name[cstate], 
-						runnode->id,
-						(unsigned long long)dev->bwr->mem_meta.head[runnode->id],
-						(unsigned long long)runnode->s_state.snd_head,
-						(unsigned long long)runnode->s_state.snd_ack_head
-						);
-				**/
-
+				async_bwr_meta(bwr);
+				set_last_flush_time(runsite->dbm);
 			}
 		}
 
@@ -346,6 +256,6 @@ int sync_dbm_thread(void *arg)
 	}
 
 	/* thread exit */
-	hadm_thread_terminate(thread);
+	complete(&thread->ev_exit);
 	return 0;
 }

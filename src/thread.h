@@ -13,13 +13,15 @@ struct thread {
 	thread_fun function;
 	void *data;
 	int state;
+	char name[MAX_NAME_LEN];
+	char funcname[MAX_NAME_LEN];
 };
 
 void *thread_function(void *data);
 
 struct thread *alloc_thread();
 
-struct thread *create_thread(thread_fun function, void *data);
+struct thread *create_thread(char *name, char *funcname, thread_fun function, void *data);
 
 void free_thread(struct thread *thr);
 

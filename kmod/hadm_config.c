@@ -5,7 +5,7 @@
 #include "hadm_config.h"
 #include "hadm_struct.h"
 #include "hadm_device.h"
-#include "hadm_node.h"
+#include "hadm_site.h"
 
 struct config *alloc_config(void)
 {
@@ -23,37 +23,58 @@ struct config *alloc_config(void)
 
 void free_config(struct config *cfg)
 {
-	int i;
+	int i, j;
+	struct site_config *site;
 	struct res_config *res;
+	struct runsite_config *runsite;
 
-	if(cfg->nodes != NULL) {
-		kfree(cfg->nodes);
+	if (cfg->sites != NULL) {
+		for (i = 0; i < cfg->site_num; i++) {
+			site = &cfg->sites[i];
+			if (site->nodes != NULL) {
+				kfree(site->nodes);
+			}
+		}
+		kfree(cfg->sites);
 	}
 
 	if(cfg->res != NULL) {
 		for(i = 0; i < cfg->res_num; i++) {
 			res = &cfg->res[i];
-			if(res->runnodes != NULL) {
-				kfree(res->runnodes);
+			if(res->runsites != NULL) {
+				for (j = 0; j < res->runsite_num; j++) {
+					runsite = &res->runsites[j];
+					if (runsite->runnodes)
+						kfree(runsite->runnodes);
+				}
+				kfree(res->runsites);
 			}
 		}
 
 		kfree(cfg->res);
 	}
+
+	if (cfg)
+		kfree(cfg);
 }
 
-static void unpack_runnode(struct runnode_config *runnode_cfg, struct runnode_conf_packet *runnode_conf_pkt)
+void unpack_runsite(struct runsite_config *runsite_cfg, struct runsite_conf_packet *runsite_conf_pkt)
 {
-	runnode_cfg->id = runnode_conf_pkt->id;
-	runnode_cfg->proto = runnode_conf_pkt->proto;
-	strncpy(runnode_cfg->disk, runnode_conf_pkt->disk, strlen(runnode_conf_pkt->disk));
-	strncpy(runnode_cfg->bwr_disk, runnode_conf_pkt->bwr_disk, strlen(runnode_conf_pkt->bwr_disk));
+	runsite_cfg->id = runsite_conf_pkt->id;
+	runsite_cfg->proto = runsite_conf_pkt->proto;
+	runsite_cfg->runnode_num = runsite_conf_pkt->runnode_num;
+	strncpy(runsite_cfg->ipaddr, runsite_conf_pkt->ipaddr, strlen(runsite_conf_pkt->ipaddr));
+	strncpy(runsite_cfg->port, runsite_conf_pkt->port, strlen(runsite_conf_pkt->port));
+	strncpy(runsite_cfg->disk, runsite_conf_pkt->disk, strlen(runsite_conf_pkt->disk));
+	strncpy(runsite_cfg->bwr_disk, runsite_conf_pkt->bwr_disk, strlen(runsite_conf_pkt->bwr_disk));
 }
 
-static void unpack_res(struct res_config *res_cfg, struct res_conf_packet *res_conf_pkt)
+void unpack_res(struct res_config *res_cfg, struct res_conf_packet *res_conf_pkt)
 {
+	pr_info("%s: res: id:%d runsite_num:%d name:%s data_len:%llu.\n",
+			__func__, res_conf_pkt->id, res_conf_pkt->runsite_num, res_conf_pkt->name, res_cfg->data_len);
 	res_cfg->id = res_conf_pkt->id;
-	res_cfg->runnode_num = res_conf_pkt->runnode_num;
+	res_cfg->runsite_num = res_conf_pkt->runsite_num;
 	strncpy(res_cfg->name, res_conf_pkt->name, strlen(res_conf_pkt->name));
 	res_cfg->data_len = res_conf_pkt->data_len;
 	res_cfg->meta_offset = res_conf_pkt->meta_offset;
@@ -63,95 +84,171 @@ static void unpack_res(struct res_config *res_cfg, struct res_conf_packet *res_c
 	res_cfg->bwr_disk_size = res_conf_pkt->bwr_disk_size;
 }
 
-static void unpack_node(struct node_config *node_cfg, struct node_conf_packet *node_conf_pkt)
+void unpack_site(struct site_config *site_cfg, struct site_conf_packet *site_conf_pkt)
 {
-	node_cfg->id = node_conf_pkt->id;
-	node_cfg->server_id = node_conf_pkt->server_id;
-	strncpy(node_cfg->hostname, node_conf_pkt->hostname, strlen(node_conf_pkt->hostname));
+	site_cfg->id = site_conf_pkt->id;
+	site_cfg->mode = site_conf_pkt->mode;
+	site_cfg->node_num = site_conf_pkt->node_num;
 }
 
-static void unpack_server(struct server_config *server_cfg, struct server_conf_packet *server_conf_pkt)
+void unpack_node(struct node_config *node_cfg, struct node_conf_packet *node_conf_pkt)
 {
-	server_cfg->id = server_conf_pkt->id;
-	strncpy(server_cfg->localipaddr, server_conf_pkt->localipaddr, strlen(server_conf_pkt->localipaddr));
-	strncpy(server_cfg->localport, server_conf_pkt->localport, strlen(server_conf_pkt->localport));
-	strncpy(server_cfg->remoteipaddr, server_conf_pkt->remoteipaddr, strlen(server_conf_pkt->remoteipaddr));
-	strncpy(server_cfg->remoteport, server_conf_pkt->remoteport, strlen(server_conf_pkt->remoteport));
+	node_cfg->id = node_conf_pkt->id;
+	strncpy(node_cfg->hostname, node_conf_pkt->hostname, strlen(node_conf_pkt->hostname));
+	strncpy(node_cfg->ipaddr, node_conf_pkt->ipaddr, strlen(node_conf_pkt->ipaddr));
+	strncpy(node_cfg->port, node_conf_pkt->port, strlen(node_conf_pkt->port));
 }
 
 struct config *unpack_config(struct conf_packet *conf_pkt)
 {
 	struct config *cfg;
-	struct server_conf_packet *server_conf_pkt;
+	struct res_config *res;
+	struct site_config *site;
+	struct node_config *node;
+	struct site_conf_packet *site_conf_pkt;
 	struct node_conf_packet *node_conf_pkt;
 	struct res_conf_packet *res_conf_pkt;
-	struct runnode_conf_packet *runnode_conf_pkt;
-	struct res_config *res_cfg;
+	struct runsite_conf_packet *runsite_conf_pkt;
+	struct node_conf_packet *runnode_conf_pkt;
 	int i;
 	int j;
+	int k;
 
 	cfg = alloc_config();
 	if(cfg == NULL) {
 		return NULL;
 	}
 
+	strncpy(cfg->serverip, conf_pkt->serverip, strlen(conf_pkt->serverip));
+	strncpy(cfg->serverport, conf_pkt->serverport, strlen(conf_pkt->serverport));
 	strncpy(cfg->kmodport, conf_pkt->kmodport, strlen(conf_pkt->kmodport));
-	cfg->ping = conf_pkt->ping;
+	cfg->maxpingcount = conf_pkt->maxpingcount;
 	cfg->pingtimeout = conf_pkt->pingtimeout;
+	cfg->site_num = conf_pkt->site_num;
 	cfg->node_num = conf_pkt->node_num;
 	cfg->res_num = conf_pkt->res_num;
-	cfg->server_num = conf_pkt->server_num;
+	cfg->local_site_id = conf_pkt->local_site_id;
 	cfg->local_node_id = conf_pkt->local_node_id;
-	cfg->local_server_id = conf_pkt->local_server_id;
 
-	/* unpack servres */
-	cfg->servers = kzalloc(cfg->server_num * sizeof(struct server_config), GFP_KERNEL);
-	if (!cfg->servers)
+	cfg->sites = kzalloc(cfg->site_num * sizeof(struct site_config), GFP_KERNEL);
+	if(cfg->sites == NULL) {
 		goto err;
-	server_conf_pkt = (struct server_conf_packet *)conf_pkt->data;
-	for (i = 0; i < cfg->server_num; i++) {
-		unpack_server(&cfg->servers[i], server_conf_pkt);
-		server_conf_pkt++;
+	}
+	memset(cfg->sites, 0, cfg->site_num * sizeof(struct site_config));
+
+	site_conf_pkt = (struct site_conf_packet *)conf_pkt->data;
+	for(i = 0; i < cfg->site_num; i++) {
+		site = &cfg->sites[i];
+		unpack_site(site, site_conf_pkt);
+
+		site->nodes = kzalloc(site->node_num * sizeof(struct node_config), GFP_KERNEL);
+		if (site->nodes == NULL)
+			goto err;
+		memset(site->nodes, 0, site->node_num * sizeof(struct node_config));
+		node_conf_pkt = (struct node_conf_packet *)site_conf_pkt->data;
+		for (j = 0; j < site_conf_pkt->node_num; j++) {
+			node = &site->nodes[j];
+			unpack_node(node, node_conf_pkt);
+
+			node_conf_pkt++;
+		}
+
+                site_conf_pkt = (struct site_conf_packet *)node_conf_pkt;
 	}
 
-	/* unpack kmod nodes */
-	cfg->nodes = kzalloc(cfg->node_num * sizeof(struct node_config), GFP_KERNEL);
-	if (!cfg->nodes)
-		goto err;
-	node_conf_pkt = (struct node_conf_packet *)server_conf_pkt;
-	for(i = 0; i < cfg->node_num; i++) {
-		unpack_node(&cfg->nodes[i], node_conf_pkt);
-		node_conf_pkt++;
-	}
-
-	/* unpack resources */
 	cfg->res = kzalloc(cfg->res_num * sizeof(struct res_config), GFP_KERNEL);
-	if (!cfg->res)
+	if(cfg->res == NULL) {
 		goto err;
-	res_conf_pkt = (struct res_conf_packet *)node_conf_pkt;
+	}
+	memset(cfg->res, 0, cfg->res_num * sizeof(struct res_config));
+
+	res_conf_pkt = (struct res_conf_packet *)site_conf_pkt;
 	for(i = 0; i < cfg->res_num; i++) {
-		res_cfg = &cfg->res[i];
-		unpack_res(res_cfg, res_conf_pkt);
-		res_cfg->runnodes = kzalloc(res_cfg->runnode_num * sizeof(struct runnode_config), GFP_KERNEL);
-		if(res_cfg->runnodes == NULL) {
+		res = &cfg->res[i];
+		unpack_res(res, res_conf_pkt);
+
+		res->runsites = kzalloc(res->runsite_num * sizeof(struct runsite_config), GFP_KERNEL);
+		if(res->runsites == NULL) {
 			goto err;
 		}
-		memset(res_cfg->runnodes, 0, res_cfg->runnode_num * sizeof(struct runnode_config));
+		memset(res->runsites, 0, res->runsite_num * sizeof(struct runsite_config));
 
-		runnode_conf_pkt = (struct runnode_conf_packet *)res_conf_pkt->data;
-		for(j = 0; j < res_cfg->runnode_num; j++) {
-			unpack_runnode(&res_cfg->runnodes[j], runnode_conf_pkt);
-			runnode_conf_pkt++;
+		runsite_conf_pkt = (struct runsite_conf_packet *)res_conf_pkt->data;
+		for(j = 0; j < res->runsite_num; j++) {
+			struct runsite_config *runsite_cfg;
+
+			runsite_cfg = &res->runsites[j];
+			unpack_runsite(runsite_cfg, runsite_conf_pkt);
+
+			runnode_conf_pkt = (struct node_conf_packet *)runsite_conf_pkt->data;
+			runsite_cfg->runnodes = kzalloc(runsite_cfg->runnode_num * sizeof(*runsite_cfg->runnodes), GFP_KERNEL);
+			if (!runsite_cfg->runnodes)
+				goto err;
+			for (k = 0; k < runsite_cfg->runnode_num; k++) {
+				struct node_config *runnode_cfg;
+
+				runnode_cfg = &runsite_cfg->runnodes[k];
+				unpack_node(runnode_cfg, runnode_conf_pkt);
+				runnode_conf_pkt++;
+			}
+
+			runsite_conf_pkt = (struct runsite_conf_packet *)runnode_conf_pkt;
 		}
 
-		res_conf_pkt = (struct res_conf_packet *)runnode_conf_pkt;
+		res_conf_pkt = (struct res_conf_packet *)runsite_conf_pkt;
 	}
 
 	return cfg;
-
 err:
 	free_config(cfg);
 	return NULL;
+}
+
+struct res_config *find_resource(struct config *cfg, int id)
+{
+	int i;
+	struct res_config *res = NULL;
+
+	for (i = 0; i < cfg->res_num; i++) {
+		res = &cfg->res[i];
+		if (id == res->id)
+			break;
+	}
+
+	return res;
+}
+
+struct site_config *find_site(struct config *cfg, int id)
+{
+	int i;
+	struct site_config *site = NULL;
+
+	for (i = 0; i < cfg->site_num; i++) {
+		site = &cfg->sites[i];
+		if (site->id == id)
+			break;
+	}
+
+	return site;
+}
+
+struct site_config *find_runsite(int id, struct config *cfg)
+{
+        int idx;
+	struct site_config *site;
+
+        for (idx = 0; idx < cfg->site_num; idx++) {
+		site = &cfg->sites[idx];
+                if (site->id == id)
+                        return site;
+	}
+
+        return NULL;
+}
+
+int get_site_id(void)
+{
+	return g_hadm->local_site_id;
 }
 
 int get_node_id(void)
@@ -159,118 +256,131 @@ int get_node_id(void)
 	return g_hadm->local_node_id;
 }
 
-uint32_t get_connected_nodes(struct hadmdev *dev)
+uint32_t get_connected_sites(struct hadmdev *dev)
 {
-	struct hadm_node *hadm_node;
-	unsigned long node_to;
+	struct hadm_site *hadm_site;
+	unsigned long site_to;
 	unsigned long flags;
 	int nstate;
 
-	node_to = 0;
-	list_for_each_entry(hadm_node, &dev->hadm_node_list, node) {
-		spin_lock_irqsave(&hadm_node->s_state.lock, flags);
-		nstate = hadm_node->s_state.n_state;
-		spin_unlock_irqrestore(&hadm_node->s_state.lock, flags);
-		if (hadm_node->id != g_hadm->local_node_id &&
+	site_to = 0;
+	list_for_each_entry(hadm_site, &dev->hadm_site_list, site) {
+		spin_lock_irqsave(&hadm_site->s_state.lock, flags);
+		nstate = hadm_site->s_state.n_state;
+		spin_unlock_irqrestore(&hadm_site->s_state.lock, flags);
+		if (hadm_site->id != g_hadm->local_site_id &&
 		    nstate == N_CONNECT)
-			set_bit(hadm_node->id, &node_to);
+			set_bit(hadm_site->id, &site_to);
 	}
 
-	return node_to;
-}
-
-uint32_t get_ready_nodes(struct hadmdev *dev)
-{
-	struct hadm_node *runnode;
-	unsigned long node_to;
-	int cstate;
-
-	node_to = 0;
-	list_for_each_entry(runnode, &dev->hadm_node_list, node) {
-		cstate = hadm_node_get(runnode, SECONDARY_STATE, S_CSTATE);
-		if (runnode->id != g_hadm->local_node_id &&
-		    cstate == C_SYNC)
-			set_bit(runnode->id, &node_to);
-	}
-
-	return node_to;
+	return site_to;
 }
 
 int is_primary(struct hadmdev *dev, int node_id)
 {
 	int role;
-	struct hadm_node *node;
+	struct hadm_site *node;
 
-	node = find_hadm_node_by_id(dev, node_id);
+	node = find_hadm_site_by_id(dev, node_id);
 	if (node == NULL || IS_ERR(node)) {
 		pr_err("is_primary: no node %d\n", node_id);
 		return 0;
 	}
-	role = hadm_node_get(node, SECONDARY_STATE, S_ROLE);
+	role = hadm_site_get(node, SECONDARY_STATE, S_ROLE);
 
 	return role == R_PRIMARY;
 }
 
-static void dump_server(const char *msg, struct server_config *server)
+void pr_config(struct config *cfg)
 {
-	pr_info("%s: id:%d|l_ip:%s|l_port:%s|r_ip:%s|r_port:%s.\n",
-			msg, server->id, server->localipaddr, server->localport,
-			server->remoteipaddr, server->remoteport);
+	int i;
+
+	pr_global_config(cfg);
+
+	pr_info("\n");
+	pr_info("Total sites: %d\n", cfg->site_num);
+	for (i = 0; i < cfg->site_num; i++)
+		pr_site_config(&cfg->sites[i]);
+	pr_info("\tlocal_site_id: %d\n", cfg->local_site_id);
+
+	pr_info("\n");
+	pr_info("Total resources: %d\n", cfg->res_num);
+	for (i = 0; i < cfg->res_num; i++)
+		pr_res_config(&cfg->res[i]);
 }
 
-static void dump_node(const char *msg, struct node_config *node)
+void pr_global_config(struct config *cfg)
 {
-	pr_info("%s: id:%d|server_id:%d|hostname:%s.\n", msg,
-			node->id, node->server_id, node->hostname);
+	pr_info("server ip: %s\n", cfg->serverip);
+	pr_info("server port: %s\n", cfg->serverport);
+	pr_info("kmodport: %s\n", cfg->kmodport);
+	pr_info("server maxpingcount: %d\n", cfg->maxpingcount);
+	pr_info("server pingtimeout: %d\n", cfg->pingtimeout);
 }
 
-static void dump_runnode(const char *msg, struct runnode_config *runnode)
+void pr_site_config(struct site_config *site)
 {
-	pr_info("%s: id:%d|proto:%d|disk:%s|bwr:%s.\n", msg, runnode->id,
-			runnode->proto, runnode->disk, runnode->bwr_disk);
-}
+	int i;
 
-static void dump_resource(const char *msg, struct res_config *res)
-{
-	int idx;
-	struct runnode_config *runnode;
+	pr_info("\tid: %d\n", site->id);
+	pr_info("\tmode: %d\n", site->mode);
+	pr_info("\tip: %s\n", site->ipaddr);
+	pr_info("\tport: %s\n", site->port);
 
-	pr_info("%s: id:%d|name:%s|data_len:%llu|meta_offset:%llu|"
-			"dbm_offset:%llu|dbm_size:%llu|bwr_offset:%llu"
-			"bwr_disk_size:%llu.\n", msg,
-			res->id, res->name, res->data_len, res->meta_offset,
-			res->dbm_offset, res->dbm_size, res->bwr_offset,
-			res->bwr_disk_size);
-
-	for (idx = 0; idx < res->runnode_num; idx++) {
-		runnode = &res->runnodes[idx];
-		dump_runnode("\t\t", runnode);
+	pr_info("\tTotal %d nodes in site:\n", site->node_num);
+	for (i = 0; i < site->node_num; i++) {
+		pr_node_config(&site->nodes[i]);
+		pr_info("\n");
 	}
 }
 
-void dump_config(const char *msg, struct config *cfg)
+void pr_node_config(struct node_config *node)
 {
-	int idx;
-	struct server_config *server;
-	struct node_config *node;
-	struct res_config *res;
+	pr_info("\t\tid: %d\n", node->id);
+	pr_info("\t\thostname: %s\n", node->hostname);
+	pr_info("\t\tip: %s\n", node->ipaddr);
+	pr_info("\t\tport: %s\n", node->port);
+}
 
-	pr_info("%s: kmodport:%s|ping:%d|pingtimeout:%d|local_server:%d"
-			"|local_node:%d.\n", msg, cfg->kmodport,
-			cfg->ping, cfg->pingtimeout,
-			cfg->local_server_id, cfg->local_node_id);
-	for (idx = 0; idx < cfg->server_num; idx++) {
-		server = &cfg->servers[idx];
-		dump_server("\t", server);
-	}
+void pr_res_config(struct res_config *res_config)
+{
+	int i;
 
-	for (idx = 0; idx < cfg->node_num; idx++) {
-		node = &cfg->nodes[idx];
-		dump_node("\t", node);
-	}
+	pr_info("\tid: %d\n", res_config->id);
+	pr_info("\tname: %s\n", res_config->name);
+	pr_info("\tdatalen: %llu\n", res_config->data_len);
+	pr_info("\tdbm_offset: %llu\n", res_config->dbm_offset);
+	pr_info("\tdbm_size: %llu\n", res_config->dbm_size);
 
-	for (idx = 0; idx < cfg->res_num; idx++) {
-		res = &cfg->res[idx];
-		dump_resource("\t", res);
+	pr_info("\tTotal runsite%s: %d\n", res_config->runsite_num > 0 ? "s" : "", res_config->runsite_num);
+	for (i = 0; i < res_config->runsite_num; i++)
+		pr_runsite_config(&res_config->runsites[i]);
+}
+
+void pr_runsite_config(struct runsite_config *runsite_config)
+{
+	int i;
+
+	pr_info("\t\tid: %d\n", runsite_config->id);
+	pr_info("\t\tproto: %s\n", runsite_config->proto ? "ASYNC" : "SYNC");
+	pr_info("\t\tipaddr: %s\n", runsite_config->ipaddr);
+	pr_info("\t\tport: %s\n", runsite_config->port);
+	pr_info("\t\tdisk: %s\n", runsite_config->disk);
+	pr_info("\t\tbwr_disk: %s\n", runsite_config->bwr_disk);
+	pr_info("\t\trunnode_num: %d\n", runsite_config->runnode_num);
+
+	for (i = 0; i < runsite_config->runnode_num; i++) {
+		pr_runnode_config(&runsite_config->runnodes[i]);
+		pr_info("\n");
 	}
 }
+
+void pr_runnode_config(struct node_config *node)
+{
+	pr_info("\t\t\tid: %d\n", node->id);
+	pr_info("\t\t\thostname: %s\n", node->hostname);
+	pr_info("\t\t\tip: %s\n", node->ipaddr);
+	pr_info("\t\t\tport: %s\n", node->port);
+}
+
+/* ----------deprecate functions -------------*/

@@ -4,247 +4,166 @@
 
 #include "hadm_config.h"
 #include "hadm_device.h"
-#include "hadm_node.h"
+#include "hadm_site.h"
 #include "hadm_bio.h"
 
 #include "bwr.h"
 #include "bio_helper.h"
 #include "buffer.h"
 
-void bwr_data_copy(struct bwr_data *dst, struct bwr_data *src)
+
+struct bwr_data *bwr_data_read(struct bwr *bwr, sector_t start)
 {
-	char *srcaddr, *dstaddr;
-
-	dst->meta.dev_sector = src->meta.dev_sector;
-	dst->meta.bwr_sector = src->meta.bwr_sector;
-
-	dstaddr = page_address(dst->data_page);
-	srcaddr = page_address(src->data_page);
-	memcpy(dstaddr, srcaddr, PAGE_SIZE);
-}
-
-struct bwr_data *get_remote_send_head_data(struct bwr *bwr, int node_id)
-{
-	sector_t snd_head;
-	char *buf;
-	int buflen;
-	struct bwr_data *bwr_data;
+	int ret;
+	struct page *page0;
+	struct page *page1;
+	struct bwr_data *data;
 	struct bwr_data_meta *meta;
-	struct hadm_node *runnode;
-	char *src, *dst;
+	struct hadm_io io_vec[2];
 
-	buflen = PAGE_SIZE + HADM_SECTOR_SIZE;
-	buf = kzalloc(buflen, GFP_KERNEL);
-
-	runnode = find_hadm_node_by_id(bwr->hadmdev, node_id);
-	if (runnode == NULL || IS_ERR(runnode)) {
-		pr_err("%s: no node %d\n", __FUNCTION__, node_id);
+	data = NULL;
+	/* meta sector */
+	page0 = alloc_page(GFP_KERNEL);
+	if (!page0) {
+		pr_err("%s: alloc page0 failed.\n", __func__);
 		return NULL;
 	}
-	snd_head = hadm_node_get(runnode, SECONDARY_STATE, S_SND_HEAD);
-	hadm_read_bwr_block(bwr->hadmdev->bwr_bdev, snd_head, buf, buflen);
+	io_vec[0].page = page0;
+	io_vec[0].start = 0;
+	io_vec[0].len = HADM_SECTOR_SIZE;
+	/* data sector */
+	page1 = alloc_page(GFP_KERNEL);
+	if (!page1) {
+		pr_err("%s: alloc page1 failed.\n", __func__);
+		goto free_page0;
+	}
+	io_vec[1].page = page1;
+	io_vec[1].start = 0;
+	io_vec[1].len = PAGE_SIZE;
 
-	bwr_data = alloc_bwr_data(GFP_KERNEL);
+	ret = hadm_io_rw_sync(bwr->hadmdev->bwr_bdev, start, READ, io_vec, 2);
+	if (ret < 0) {
+		pr_err("%s: read bwr data failed.\n", __func__);
+		goto free_page1;
+	}
 
-	meta = (struct bwr_data_meta *)buf;
-	bwr_data->meta.dev_sector = meta->dev_sector;
-	bwr_data->meta.bwr_sector = snd_head;
-	bwr_data->meta.bwr_seq = meta->bwr_seq;
-	bwr_data->meta.uuid = meta->uuid;
-	bwr_data->meta.checksum = meta->checksum;
-	src = (char *)meta + HADM_SECTOR_SIZE;
-	dst = page_address(bwr_data->data_page);
-	memcpy(dst, src, PAGE_SIZE);
+	data = alloc_bwr_data(GFP_KERNEL);
+	if (!data) {
+		pr_err("%s: alloc data failed.\n", __FUNCTION__);
+		goto free_page1;
+	}
+	meta = (struct bwr_data_meta *)(page_address(page0));
+	data->meta.dev_sector = meta->dev_sector;
+	data->meta.bwr_sector = start;
+	data->meta.bwr_seq = meta->bwr_seq;
+	data->meta.uuid = meta->uuid;
+	data->meta.checksum = meta->checksum;
+	get_page(page1);
+	data->data_page = page1;
+	set_page_private(page1, (unsigned long)data);
 
-	kfree(buf);
-	return bwr_data;
+free_page1:
+	__free_page(page1);
+free_page0:
+	__free_page(page0);
+	return data;
 }
 
 /**
  * we want snd_head_data lock free, so we need check it.
  * */
-struct bwr_data *get_snd_head_data_from_buffer(struct bwr *bwr, struct hadm_node *runnode, sector_t prev_seq)
+struct bwr_data *get_snd_head_data_from_buffer(struct bwr *bwr, struct hadm_site *runsite)
 {
 	sector_t snd_head;
 	struct bwr_data *copy_bwr_data = NULL;
 	struct data_buffer *buffer = bwr->hadmdev->buffer;
-	if(!prev_seq)
-		return NULL;
-	/* snd_head_data update when finish sync it. */
-	snd_head = hadm_node_get(runnode, SECONDARY_STATE, S_SND_HEAD);
-	if (runnode->s_state.snd_head_data != NULL) {
-		if (unlikely(runnode->s_state.snd_head_data->meta.bwr_sector != snd_head)) {
-			pr_info("%s: hadm%d node %d's snd_head_data(%p seq:%llu bwr_sector:%llu) is mismatched with snd_head %llu, reset now\n",
-					__FUNCTION__, runnode->hadmdev->minor,
-					runnode->id, runnode->s_state.snd_head_data,
-					(unsigned long long)runnode->s_state.snd_head_data->meta.bwr_seq,
-					(unsigned long long)runnode->s_state.snd_head_data->meta.bwr_sector,
-					(unsigned long long)snd_head);
 
-			hadm_node_send_head_data_set(runnode, NULL);
-		}
+	/* snd_head_data update when finish sync it. */
+	snd_head = hadm_site_get(runsite, SECONDARY_STATE, S_SND_HEAD);
+	if (runsite->s_state.snd_head_data != NULL) {
+		if (unlikely(runsite->s_state.snd_head_data->meta.bwr_sector != snd_head))
+			hadm_site_send_head_data_set(runsite, NULL);
 		else {
-			if(unlikely(prev_seq && runnode->s_state.snd_head_data->meta.bwr_seq != prev_seq + 1)){
-				pr_warn("%s:hadm%d send head data sequence is mismatch, seq %llu, expect %llu\n",
-						__FUNCTION__, runnode->hadmdev->minor,
-						(unsigned long long)runnode->s_state.snd_head_data->meta.bwr_seq ,
-						(unsigned long long)(prev_seq + 1));
-				hadm_node_send_head_data_set(runnode, NULL);
-			}else {
-				bwr_data_get(runnode->s_state.snd_head_data);
-				copy_bwr_data = runnode->s_state.snd_head_data;
-			}
+			bwr_data_get(runsite->s_state.snd_head_data);
+			copy_bwr_data = runsite->s_state.snd_head_data;
 		}
 	}
 	if (!copy_bwr_data) {
-		BUFFER_DEBUG("%s: hadm%d get node %d snd head data from buffer failed. search it in buffer, snd_head = %llu, prev_seq = %llu\n",
-			       	__FUNCTION__, runnode->hadmdev->minor, runnode->id,
-				(unsigned long long)snd_head,
-				(unsigned long long)prev_seq);
-		copy_bwr_data = get_find_data_by_bwr(buffer, snd_head, prev_seq);
-		if (copy_bwr_data){
-			BUFFER_DEBUG("%s: hadm%d node %d's snd head(now %p) is set to %p by get_find_data_by_bwr.\n",
-					__FUNCTION__,
-					runnode->hadmdev->minor, 
-					runnode->id, runnode->s_state.snd_head_data, copy_bwr_data);
-			hadm_node_send_head_data_set(runnode, copy_bwr_data);
-		}
+		copy_bwr_data = get_find_data_by_bwr(buffer, snd_head);
+		if (copy_bwr_data)
+			hadm_site_send_head_data_set(runsite, copy_bwr_data);
 	}
 
 	return copy_bwr_data;
 }
 
-
-#if 0
-/* FIXME common_get_send_head_data ? or
- * common_get_send_head_data_from_buffer ?
- */
-struct bwr_data *common_get_send_head_data(struct bwr *bwr, int node_id)
+/* get(refcnt++) head bwr data for non-local site */
+struct bwr_data *get_send_head_data(struct bwr *bwr, int node_id)
 {
-	struct bwr_data *copy_bwr_data;
-	sector_t snd_head;
-	struct hadm_node *runnode;
-	struct data_buffer *buffer = bwr->hadmdev->buffer;
+	struct bwr_data *bwr_data;
+	sector_t snd_head, tail;
+	struct hadm_site *runsite;
 
-	/* NOTE: debug */
-	return NULL;
+	if (node_id == get_site_id()) {
+		pr_err("%s: Not for local site.\n", __FUNCTION__);
+		return NULL;
+	}
 
-	runnode = find_hadm_node_by_id(bwr->hadmdev, node_id);
-	if (runnode == NULL || IS_ERR(runnode)) {
+	runsite = find_hadm_site_by_id(bwr->hadmdev, node_id);
+	if (runsite == NULL || IS_ERR(runsite)) {
 		pr_err("%s: no node %d\n", __FUNCTION__, node_id);
 		return NULL;
 	}
-	snd_head = hadm_node_get(runnode, SECONDARY_STATE, S_SND_HEAD);
 
-	copy_bwr_data = get_find_data_by_bwr(buffer, snd_head);
-
-	return copy_bwr_data;
-}
-#endif
-
-struct bwr_data *get_send_head_data(struct bwr *bwr, int node_id, sector_t prev_seq)
-{
-	int local_node_id = get_node_id();
-	struct bwr_data *bwr_data = NULL;
-	sector_t snd_head;
-	struct hadm_node *runnode;
-	int from = 0 ;
-
-	runnode = find_hadm_node_by_id(bwr->hadmdev, node_id);
-	if (runnode == NULL || IS_ERR(runnode)) {
-		pr_err("%s: no node %d\n", __FUNCTION__, node_id);
+	bwr_data = NULL;
+	tail = bwr_tail(bwr);
+	snd_head = hadm_site_get(runsite, SECONDARY_STATE, S_SND_HEAD);
+	if (snd_head == tail)
 		return NULL;
-	}
-	if(bwr_seq(bwr) == 1) {
-		//1 mean no data in bwr
-		return NULL;
-	}
 
-	snd_head = hadm_node_get(runnode, SECONDARY_STATE, S_SND_HEAD);
-	if(!valid_bwr_sector(bwr, node_id, snd_head)) {
-		return NULL;
-	}
-	if(prev_seq || node_id == local_node_id){
-		bwr_data = get_snd_head_data_from_buffer(bwr, runnode, prev_seq);
-	}
-	//bwr_data = common_get_send_head_data(bwr, node_id);
-	if (bwr_data == NULL && node_id != local_node_id){
-//		pr_info("can not get send_head data from buffer.!");
-		bwr_data = get_remote_send_head_data(bwr, node_id);
-		from = 1;
-	}
-	if(bwr_data == NULL) {
-		return NULL;
-	}
-	if(unlikely(seq_to_bwr(bwr_data->meta.bwr_seq , bwr) != bwr_data->meta.bwr_sector ||
-			bwr_data->meta.bwr_sector != snd_head||
-			(prev_seq && bwr_data->meta.bwr_seq != prev_seq + 1))) {
-		pr_warn("%s:invalid bwr_data from %s , hadm%d node_id = %d snd_head %llu and seq %llu(expect:%llu) and bwr_sector %llu mismatched\n",
-			       	__FUNCTION__, from ? "disk":"buffer",
-			       	runnode->hadmdev->minor, runnode->id,
-			       	(unsigned long long)snd_head,
-				(unsigned long long)bwr_data->meta.bwr_seq ,
-				(unsigned long long)(prev_seq + 1),
-				(unsigned long long)bwr_data->meta.bwr_sector);
-		pr_info("%s:hadm%d node %d's snd_head_data = %p (bwr_seq %llu, bwr_sector %llu)\n",
-				__FUNCTION__, runnode->hadmdev->minor, 
-				runnode->id, runnode->s_state.snd_head_data ,
-				(runnode->s_state.snd_head_data) ? (unsigned long long)runnode->s_state.snd_head_data->meta.bwr_seq : 0,
-				(runnode->s_state.snd_head_data) ? (unsigned long long)runnode->s_state.snd_head_data->meta.bwr_sector : 0);
-		bwr_dump(bwr);
-		if(BUFF_DEBUG) {
-			dump_stack();
-			BUG();
+	/* FIXME: snd_head_data in s_state, but not protected by s_state lock
+	 * TODO:  summarize the usage of snd_head_data
+	 * */
+	/* first search in cache snd_head_data */
+	if (runsite->s_state.snd_head_data != NULL) {
+		if (unlikely(runsite->s_state.snd_head_data->meta.bwr_sector != snd_head))
+			hadm_site_send_head_data_set(runsite, NULL);
+		else {
+			bwr_data_get(runsite->s_state.snd_head_data);
+			bwr_data = runsite->s_state.snd_head_data;
 		}
-		else{
-			hadmdev_set_error(bwr->hadmdev, __BWR_ERR);
-			return NULL;
-		}
+	}
+	/* then search in buffer */
+	if (!bwr_data) {
+		bwr_data = get_find_data_by_bwr(bwr->hadmdev->buffer, snd_head);
+		if (bwr_data)
+			hadm_site_send_head_data_set(runsite, bwr_data);
+	}
+
+	/* finally, read from disk */
+	if (!bwr_data) {
+		//pr_info("can not get send_head data from buffer.!");
+		bwr_data = bwr_data_read(bwr, snd_head);
 	}
 
 	return bwr_data;
 }
-
-void bwr_data_add(struct bwr *bwr, struct bwr_data *data)
-{
-	write_lock(&bwr->bwr_data_list_rwlock);
-	if (bwr->bwr_data_list_len == bwr->bwr_data_list_max_size) {
-		bwr->waiters += 1;
-		write_unlock(&bwr->bwr_data_list_rwlock);
-		wait_for_completion(&bwr->ev_wait);
-		write_lock(&bwr->bwr_data_list_rwlock);
-	}
-	list_add_tail(&data->list, &bwr->bwr_data_list);
-	bwr->bwr_data_list_len += 1;
-	write_unlock(&bwr->bwr_data_list_rwlock);
-}
-
 
 struct bwr_data *alloc_bwr_data(gfp_t gfp_mask)
 {
-	struct page *page;
 	struct bwr_data *bwr_data;
-
-	page = alloc_page(gfp_mask);
-	if (!page)
-		goto alloc_page_fail;
 
 	bwr_data = kmalloc(sizeof(struct bwr_data), gfp_mask);
 	if (!bwr_data)
-		goto alloc_bwr_data_fail;
+		return NULL;
 	atomic_set(&bwr_data->refcnt, 1);
 	INIT_LIST_HEAD(&bwr_data->list);
+        INIT_HLIST_NODE(&bwr_data->list_hash);
 	bwr_data->flags = 0UL;
-	bwr_data->data_page = page;
+	bwr_data->data_page = NULL;
+	bwr_data->private = NULL;
 
 	return bwr_data;
-
-alloc_bwr_data_fail:
-	__free_page(page);
-
-alloc_page_fail:
-	pr_err("%s: no mem.\n", __FUNCTION__);
-	return NULL;
 }
 
 static void __free_bwr_data(struct bwr_data *data)
@@ -271,17 +190,14 @@ void bwr_data_put(struct bwr_data *bwr_data)
 		return;
 	}
 	if (unlikely(atomic_read(&bwr_data->refcnt) == 0)) {
-		pr_err("put bwr_data %p, which refcnt equals zero. BUG\n", bwr_data);
+		pr_err("put bwr_data, which refcnt equals zero. BUG\n");
 		dump_stack();
 		return;
 	}
-//	pr_info("put bwr_data %p, now refcnt = %d\n",
-//			bwr_data, atomic_read(&bwr_data->refcnt) - 1);
 	if (atomic_dec_and_test(&bwr_data->refcnt))
 		__free_bwr_data(bwr_data);
 }
 
-/* FIXME duplicate function init_bwr_data, alloc_bwr_data */
 struct bwr_data *init_bwr_data(sector_t bwr_sector, sector_t dev_sector,
 		uint64_t bwr_seq, u32 checksum, uint64_t uuid, struct page *data_page)
 {
@@ -309,48 +225,15 @@ struct bwr_data *init_bwr_data(sector_t bwr_sector, sector_t dev_sector,
 	return bwr_data;
 }
 
-struct bwr_data *find_get_bwr_data(struct hadmdev *dev, sector_t offset)
+void dump_bwr_data(const char *msg, struct bwr_data *data)
 {
-	struct bwr_data *bwr_data;
-	sector_t tail;
-	sector_t i = 0;
-	sector_t head = 0;
-	struct bwr_data *p = NULL;
-	char *src, *dst;
+	struct bwr_data_meta *meta = &data->meta;
 
-	bwr_data = kzalloc(sizeof(struct bwr_data), GFP_KERNEL);
-	if (bwr_data == NULL) {
-	}
-	bwr_data->data_page = alloc_page(GFP_KERNEL);
-	if (bwr_data->data_page == NULL) {
-	}
-
-	/* FIXME: add rw arg */
-	read_lock(&dev->bwr->lock);
-	tail = dev->bwr->mem_meta.tail;
-	/* get from memory */
-	head = __bwr_get_min_head(dev->bwr, NULL);
-	if (bwr_sector_cmp(dev->bwr, offset, head, tail)) {
-		i = 0;
-		list_for_each_entry(p, &dev->bwr->bwr_data_list, list) {
-			if (i == offset) {
-				memcpy(bwr_data, p, sizeof(struct bwr_data));
-				dst = page_address(bwr_data->data_page);
-				src = page_address(p->data_page);
-				memcpy(dst, src, PAGE_SIZE);
-				break;
-			}
-			i += 9;
-		}
-		read_unlock(&dev->bwr->lock);
-	}
-
-	/* get from disk */
-	else {
-		read_unlock(&dev->bwr->lock);
-		/* read from bwr, offset */
-		/* read_from_bwr(bwr_data, offset); */
-	}
-
-	return p;
+	pr_info("%s:\n"
+		"flags:%lu|refcnt:%d|data_page:%p\n"
+		"uuid:%llu|seq:%llu|checksum:%u|bwr_sector:%lu|"
+		"dev_sector:%lu.\n",
+		msg, data->flags, atomic_read(&data->refcnt), data->data_page,
+		meta->uuid, meta->bwr_seq, meta->checksum, meta->bwr_sector,
+		meta->dev_sector);
 }

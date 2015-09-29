@@ -2,36 +2,174 @@
 
 #define MAX_EXPR_LEN 1024
 
+#define SERVERIP "/hadm/global/serverip"
+#define SERVERPORT "/hadm/global/serverport"
 #define KMODPORT "/hadm/global/kmodport"
-#define PING "/hadm/global/ping"
+#define MAXPINGCOUNT "/hadm/global/maxpingcount"
 #define PINGTIMEOUT "/hadm/global/pingtimeout"
 
-#define SERVER "/hadm/servers/server"
-#define SERVER_ID "/hadm/servers/server[%d]/id"
-#define SERVER_LOCALIPADDR "/hadm/servers/server[%d]/localipaddr"
-#define SERVER_LOCALPORT "/hadm/servers/server[%d]/localport"
-#define SERVER_REMOTEIPADDR "/hadm/servers/server[%d]/remoteipaddr"
-#define SERVER_REMOTEPORT "/hadm/servers/server[%d]/remoteport"
+#define SITE "/hadm/sites/site"
+#define SITE_ID "/hadm/sites/site[%d]/id"
+#define SITE_MODE "/hadm/sites/site[%d]/mode"
 
-#define NODE "/hadm/nodes/node"
-#define NODE_ID "/hadm/nodes/node[%d]/id"
-#define NODE_SERVERID "/hadm/nodes/node[%d]/serverid"
-#define NODE_HOSTNAME "/hadm/nodes/node[%d]/hostname"
+#define NODE "/hadm/sites/site[%d]/nodes/node"
+#define NODE_ID "/hadm/sites/site[%d]/nodes/node[%d]/id"
+#define NODE_HOSTNAME "/hadm/sites/site[%d]/nodes/node[%d]/hostname"
+#define NODE_IPADDR "/hadm/sites/site[%d]/nodes/node[%d]/ipaddr"
+#define NODE_PORT "/hadm/sites/site[%d]/nodes/node[%d]/port"
 
 #define RESOURCE "/hadm/resources/resource"
 #define RESOURCE_ID "/hadm/resources/resource[%d]/id"
 #define RESOURCE_NAME "/hadm/resources/resource[%d]/name"
 
-#define RUNNODE "/hadm/resources/resource[%d]//runnode"
-#define RUNNODE_ID "/hadm/resources/resource[%d]/runnodes/runnode[%d]/id"
-#define RUNNODE_PROTO "/hadm/resources/resource[%d]/runnodes/runnode[%d]/protocol"
-#define RUNNODE_DISK "/hadm/resources/resource[%d]/runnodes/runnode[%d]/disk"
-#define RUNNODE_BWR_DISK "/hadm/resources/resource[%d]/runnodes/runnode[%d]/bwr_disk"
+#define RUNSITE "/hadm/resources/resource[%d]/runsites/runsite"
+#define RUNSITE_ID "/hadm/resources/resource[%d]/runsites/runsite[%d]/id"
+#define RUNSITE_PROTO "/hadm/resources/resource[%d]/runsites/runsite[%d]/protocol"
+#define RUNSITE_DISK "/hadm/resources/resource[%d]/runsites/runsite[%d]/disk"
+#define RUNSITE_BWR_DISK "/hadm/resources/resource[%d]/runsites/runsite[%d]/bwr_disk"
+#define RUNSITE_IPADDR "/hadm/resources/resource[%d]/runsites/runsite[%d]/ip"
+#define RUNSITE_PORT "/hadm/resources/resource[%d]/runsites/runsite[%d]/port"
+
+#define RUNNODE "/hadm/resources/resource[%d]/runsites/runsite[%d]/runnodes/id"
+#define RUNNODE_ID "/hadm/resources/resource[%d]/runsites/runsite[%d]/runnodes/id[%d]"
 
 #define ASYNC "async"
 #define SYNC "sync"
 
-static xmlXPathObjectPtr exec_xpath_expr(xmlXPathContextPtr ctx, const char *expr)
+#define SHARE "share"
+#define UNSHARE "stand along"
+
+char *trim(const char *str)
+{
+	char *res;
+	int len;
+	int i;
+	int j;
+
+	len = strlen(str);
+	res = malloc(len + 1);
+	if(res == NULL) {
+		return NULL;
+	}
+	memset(res, 0, len + 1);
+
+	for(i = 0, j = 0; i < len; i++) {
+		if(!isspace(str[i])) {
+			res[j++] = str[i];
+		}
+	}
+
+	return res;
+}
+
+struct config *alloc_config()
+{
+	struct config *cfg;
+
+	cfg = malloc(sizeof(struct config));
+	if(cfg == NULL) {
+		return NULL;
+	}
+
+	memset(cfg, 0, sizeof(struct config));
+
+	return cfg;
+}
+
+void free_config(struct config *cfg)
+{
+	int i;
+	struct site_config *site;
+	struct res_config *res;
+
+	if(cfg->sites != NULL) {
+		for(i = 0; i < cfg->site_num; i++) {
+			site = &cfg->sites[i];
+			if(site->nodes != NULL)
+				free(site->nodes);
+		}
+
+		free(cfg->sites);
+	}
+
+	if(cfg->res != NULL) {
+		for(i = 0; i < cfg->res_num; i++) {
+			res = &cfg->res[i];
+			if(res->runsites != NULL) {
+				free(res->runsites);
+			}
+		}
+
+		free(cfg->res);
+	}
+}
+
+struct config *load_config(const char *filename)
+{
+	xmlDocPtr doc;
+	xmlXPathContextPtr ctx;
+	struct config *cfg;
+	int local_site_id;
+	int local_node_id;
+
+	doc = xmlParseFile(filename);
+	if(doc == NULL) {
+		return NULL;
+	}
+
+	ctx = xmlXPathNewContext(doc);
+	if(ctx == NULL) {
+		xmlFreeDoc(doc);
+		return NULL;
+	}
+
+	cfg = alloc_config();
+	if(cfg == NULL) {
+		goto err;
+	}
+
+	if(get_global(ctx, cfg) < 0) {
+		goto err_config;
+	}
+
+	if(get_sites(ctx, cfg) < 0) {
+		goto err_config;
+	}
+
+	if(get_resources(ctx, cfg) < 0) {
+		goto err_config;
+	}
+
+	local_site_id = get_local_site_id(cfg, &local_node_id);
+	if(local_site_id < 0) {
+		log_error("cannot find local node id");
+		goto err_config;
+	}
+
+
+	cfg->local_site_id = local_site_id;
+	cfg->local_node_id = local_node_id;
+
+        if (trim_nonlocal_res(cfg) < 0) {
+                goto err_config;
+        }
+
+	xmlXPathFreeContext(ctx);
+	xmlFreeDoc(doc);
+
+	return cfg;
+
+err_config:
+	free_config(cfg);
+
+err:
+	xmlXPathFreeContext(ctx);
+	xmlFreeDoc(doc);
+
+	return NULL;
+}
+
+xmlXPathObjectPtr exec_xpath_expr(xmlXPathContextPtr ctx, const char *expr)
 {
 	xmlXPathObjectPtr obj;
 
@@ -43,7 +181,7 @@ static xmlXPathObjectPtr exec_xpath_expr(xmlXPathContextPtr ctx, const char *exp
 	return obj;
 }
 
-static char *get_content(xmlXPathContextPtr ctx, const char *expr)
+char *get_content(xmlXPathContextPtr ctx, const char *expr)
 {
 	xmlXPathObjectPtr obj;
 	xmlNodeSetPtr pnodes;
@@ -72,7 +210,62 @@ err:
 	return NULL;
 }
 
-static int get_kmodport(xmlXPathContextPtr ctx, struct config *cfg)
+int get_global(xmlXPathContextPtr ctx, struct config *cfg)
+{
+	if(get_serverip(ctx, cfg) < 0) {
+		return -1;
+	}
+
+	if(get_serverport(ctx, cfg) < 0) {
+		return -1;
+	}
+
+	if(get_kmodport(ctx, cfg) < 0) {
+		return -1;
+	}
+
+	if(get_pingtimeout(ctx, cfg) < 0) {
+		return -1;
+	}
+
+	if(get_maxpingcount(ctx, cfg) < 0) {
+		return -1;
+	}
+
+	return 0;
+}
+
+int get_serverip(xmlXPathContextPtr ctx, struct config *cfg)
+{
+	char *content;
+
+	content = get_content(ctx, SERVERIP);
+	if(content == NULL) {
+		return -1;
+	}
+
+	strncpy(cfg->serverip, content, strlen(content));
+
+	free(content);
+	return 0;
+}
+
+int get_serverport(xmlXPathContextPtr ctx, struct config *cfg)
+{
+	char *content;
+
+	content = get_content(ctx, SERVERPORT);
+	if(content == NULL) {
+		return -1;
+	}
+
+	strncpy(cfg->serverport, content, strlen(content));
+
+	free(content);
+	return 0;
+}
+
+int get_kmodport(xmlXPathContextPtr ctx, struct config *cfg)
 {
 	char *content;
 
@@ -87,322 +280,334 @@ static int get_kmodport(xmlXPathContextPtr ctx, struct config *cfg)
 	return 0;
 }
 
-static int get_ping(xmlXPathContextPtr ctx, struct config *cfg)
+int get_pingtimeout(xmlXPathContextPtr ctx, struct config *cfg)
 {
 	char *content;
-	int ping;
-
-	content = get_content(ctx, PING);
-	if(content == NULL) {
-		return -1;
-	}
-
-	ping = atoi(content);
-	cfg->ping = ping;
-
-	free(content);
-	return 0;
-}
-
-static int get_pingtimeout(xmlXPathContextPtr ctx, struct config *cfg)
-{
-	char *content;
-	int pingtimeout;
 
 	content = get_content(ctx, PINGTIMEOUT);
 	if(content == NULL) {
 		return -1;
 	}
 
-	pingtimeout = atoi(content);
-	cfg->pingtimeout = pingtimeout;
+	cfg->pingtimeout = atoi(content);
 
 	free(content);
 	return 0;
 }
 
-static int get_global(xmlXPathContextPtr ctx, struct config *cfg)
+int get_maxpingcount(xmlXPathContextPtr ctx, struct config *cfg)
 {
-	if(get_kmodport(ctx, cfg) < 0) {
-		return -1;
-	}
-
-	if(get_ping(ctx, cfg) < 0) {
-		return -1;
-	}
-
-	if(get_pingtimeout(ctx, cfg) < 0) {
-		return -1;
-	}
-
-	return 0;
-}
-
-static int get_server(xmlXPathContextPtr ctx, struct config *cfg, int index)
-{
-	char expr[MAX_EXPR_LEN];
-	struct server_config *server;
 	char *content;
 
-	server = &cfg->servers[index];
-
-	memset(expr, 0, sizeof(expr));
-	snprintf(expr, sizeof(expr), SERVER_ID, index + 1);
-	content = get_content(ctx, expr);
+	content = get_content(ctx, MAXPINGCOUNT);
 	if(content == NULL) {
 		return -1;
 	}
 
-	server->id = atoi(content);
+	cfg->maxpingcount = atoi(content);
+
 	free(content);
-
-	memset(expr, 0, sizeof(expr));
-	snprintf(expr, sizeof(expr), SERVER_LOCALIPADDR, index + 1);
-	content = get_content(ctx, expr);
-	if(content == NULL) {
-		return -1;
-	}
-
-	strncpy(server->localipaddr, content, strlen(content));
-	free(content);
-
-	memset(expr, 0, sizeof(expr));
-	snprintf(expr, sizeof(expr), SERVER_LOCALPORT, index + 1);
-	content = get_content(ctx, expr);
-	if(content == NULL) {
-		return -1;
-	}
-
-	strncpy(server->localport, content, strlen(content));
-	free(content);
-
-	memset(expr, 0, sizeof(expr));
-	snprintf(expr, sizeof(expr), SERVER_REMOTEIPADDR, index + 1);
-	content = get_content(ctx, expr);
-	if(content == NULL) {
-		return -1;
-	}
-
-	strncpy(server->remoteipaddr, content, strlen(content));
-	free(content);
-
-	memset(expr, 0, sizeof(expr));
-	snprintf(expr, sizeof(expr), SERVER_REMOTEPORT, index + 1);
-	content = get_content(ctx, expr);
-	if(content == NULL) {
-		return -1;
-	}
-
-	strncpy(server->remoteport, content, strlen(content));
-	free(content);
-
 	return 0;
 }
 
-static int get_servers(xmlXPathContextPtr ctx, struct config *cfg)
-{
-	int i;
-	xmlXPathObjectPtr obj;
-	xmlNodeSetPtr pnodes;
-
-	obj = exec_xpath_expr(ctx, SERVER);
-	if(obj == NULL){
-		return -1;
-	}
-
-	pnodes = obj->nodesetval;
-
-	if(pnodes->nodeNr <= 0) {
-		goto err;
-	}
-
-	cfg->server_num = pnodes->nodeNr;
-	cfg->servers = malloc(cfg->server_num * sizeof(struct server_config));
-	if(cfg->servers == NULL) {
-		goto err;
-	}
-	memset(cfg->servers, 0, cfg->server_num * sizeof(struct server_config));
-
-	for(i = 0; i < cfg->server_num; i++) {
-		if(get_server(ctx, cfg, i) < 0) {
-			goto err_server;
-		}
-	}
-
-	xmlXPathFreeObject(obj);
-	return 0;
-
-err_server:
-	if(cfg->servers != NULL) {
-		free(cfg->servers);
-		cfg->servers = NULL;
-	}
-
-err:
-	xmlXPathFreeObject(obj);
-	return -1;
-}
-
-static int get_node(xmlXPathContextPtr ctx, struct config *cfg, int index)
+int get_node(xmlXPathContextPtr ctx, struct config *cfg, int site_idx, int idx)
 {
 	char expr[MAX_EXPR_LEN];
+	struct site_config *site;
 	struct node_config *node;
 	char *content;
 
-	node = &cfg->nodes[index];
+	site = &cfg->sites[site_idx];
+	node = &site->nodes[idx];
 
 	memset(expr, 0, sizeof(expr));
-	snprintf(expr, sizeof(expr), NODE_ID, index + 1);
+	snprintf(expr, sizeof(expr), NODE_ID, site_idx + 1, idx + 1);
 	content = get_content(ctx, expr);
 	if(content == NULL) {
-		log_error("missing node id in config file.");
 		return -1;
 	}
-
 	node->id = atoi(content);
 	free(content);
 
 	memset(expr, 0, sizeof(expr));
-	snprintf(expr, sizeof(expr), NODE_SERVERID, index + 1);
+	snprintf(expr, sizeof(expr), NODE_HOSTNAME, site_idx + 1, idx + 1);
 	content = get_content(ctx, expr);
 	if(content == NULL) {
-		log_error("missing node ip for node %d in config file.",
-				node->id);
 		return -1;
 	}
-
-	node->server_id = atoi(content);
-	free(content);
-
-	memset(expr, 0, sizeof(expr));
-	snprintf(expr, sizeof(expr), NODE_HOSTNAME, index + 1);
-	content = get_content(ctx, expr);
-	if(content == NULL) {
-		log_error("missing node port for node %d in config file.",
-				node->id);
-		return -1;
-	}
-
 	strncpy(node->hostname, content, strlen(content));
 	free(content);
 
-	return 0;
-}
-
-static int get_nodes(xmlXPathContextPtr ctx, struct config *cfg)
-{
-	xmlXPathObjectPtr obj;
-	xmlNodeSetPtr pnodes;
-	int i;
-
-	obj = exec_xpath_expr(ctx, NODE);
-	if(obj == NULL){
-		return -1;
-	}
-
-	pnodes = obj->nodesetval;
-	if(pnodes->nodeNr <= 0) {
-		goto err;
-	}
-
-	cfg->node_num = pnodes->nodeNr;
-	cfg->nodes = malloc(cfg->node_num * sizeof(struct node_config));
-	if(cfg->nodes == NULL) {
-		goto err;
-	}
-	memset(cfg->nodes, 0, cfg->node_num * sizeof(struct node_config));
-
-	for(i = 0; i < cfg->node_num; i++) {
-		if(get_node(ctx, cfg, i) < 0) {
-			goto err_node;
-		}
-	}
-
-	xmlXPathFreeObject(obj);
-	return 0;
-
-err_node:
-	if(cfg->nodes) {
-		free(cfg->nodes);
-		cfg->nodes = NULL;
-	}
-
-err:
-	xmlXPathFreeObject(obj);
-	return -1;
-}
-
-static int get_runnode(xmlXPathContextPtr ctx, struct config *cfg, int res_index, int runnode_index)
-{
-	char expr[MAX_EXPR_LEN];
-	struct res_config *res;
-	struct runnode_config *runnode;
-	char *content;
-
-	res = &cfg->res[res_index];
-	runnode = &res->runnodes[runnode_index];
-
 	memset(expr, 0, sizeof(expr));
-	snprintf(expr, sizeof(expr), RUNNODE_ID, res_index + 1, runnode_index + 1);
+	snprintf(expr, sizeof(expr), NODE_IPADDR, site_idx + 1, idx + 1);
 	content = get_content(ctx, expr);
 	if(content == NULL) {
-		log_error("missing runnode id(res: %d).",
-				res->id);
 		return -1;
 	}
-
-	runnode->id = atoi(content);
+	strncpy(node->ipaddr, content, strlen(content));
 	free(content);
 
 	memset(expr, 0, sizeof(expr));
-	snprintf(expr, sizeof(expr), RUNNODE_PROTO, res_index + 1, runnode_index + 1);
+	snprintf(expr, sizeof(expr), NODE_PORT, site_idx + 1, idx + 1);
 	content = get_content(ctx, expr);
 	if(content == NULL) {
-		log_error("missing runnode proto(res: %d).",
-				res->id);
+		return -1;
+	}
+	strncpy(node->port, content, strlen(content));
+	free(content);
+
+	return 0;
+}
+
+int get_runnode(xmlXPathContextPtr ctx, struct config *cfg, int res_idx, int runsite_idx, int idx)
+{
+	struct res_config *res;
+	struct runsite_config *runsite;
+	struct node_config *node;
+	struct site_config *site;
+	struct node_config *raw_node;
+	char expr[MAX_EXPR_LEN];
+	char *content;
+	int id;
+
+	res = &cfg->res[res_idx];
+	runsite = &res->runsites[runsite_idx];
+	node = &runsite->runnodes[idx];
+
+	/* id */
+	memset(expr, 0, sizeof(expr));
+	snprintf(expr, sizeof(expr), RUNNODE_ID, res_idx + 1, runsite_idx + 1, idx + 1);
+	content = get_content(ctx, expr);
+	if (!content)
+		return -1;
+	id = atoi(content);
+	free(content);
+
+	site = &cfg->sites[runsite->id];
+	raw_node = &site->nodes[id];
+	*node = *raw_node;
+
+	return 0;
+}
+
+int get_site(xmlXPathContextPtr ctx, struct config *cfg, int idx)
+{
+	char expr[MAX_EXPR_LEN];
+	struct site_config *site = &cfg->sites[idx];
+	xmlXPathObjectPtr obj;
+	xmlNodeSetPtr pnodes;
+	char *content;
+	int i;
+
+	memset(expr, 0, sizeof(expr));
+	snprintf(expr, sizeof(expr), SITE_ID, idx + 1);
+	content = get_content(ctx, expr);
+	if(content == NULL) {
+		return -1;
+	}
+	site->id = atoi(content);
+	free(content);
+
+	/* NOTE: configure site name in hadm_config.xml ? */
+	snprintf(site->sitename, MAX_HOSTNAME_LEN, "site[%d]", site->id);
+
+	memset(expr, 0, sizeof(expr));
+	snprintf(expr, sizeof(expr), SITE_MODE, idx + 1);
+	content = get_content(ctx, expr);
+	if(content == NULL) {
 		return -1;
 	}
 
-	if(!strcmp(content, ASYNC)) {
-		runnode->proto = PROTO_ASYNC;
-	} else if(!strcmp(content, SYNC)) {
-		runnode->proto = PROTO_SYNC;
-	} else {
-		log_error("wrong proto for runnode %d(res: %d).",
-				runnode->id, res->id);
+	if (!strncmp(content, SHARE, strlen(SHARE)))
+		site->mode = MODE_SHARE;
+	else if (!strncmp(content, UNSHARE, strlen(UNSHARE)))
+		site->mode = MODE_UNSHARE;
+	else {
 		free(content);
 		return -1;
 	}
 	free(content);
 
 	memset(expr, 0, sizeof(expr));
-	snprintf(expr, sizeof(expr), RUNNODE_DISK, res_index + 1, runnode_index + 1);
-	content = get_content(ctx, expr);
-	if(content == NULL) {
-		log_error("missing disk name for runnode %d(res: %d).",
-				runnode->id, res->id);
+	snprintf(expr, sizeof(expr), NODE, idx + 1);
+	obj = exec_xpath_expr(ctx, expr);
+	if(obj == NULL){
 		return -1;
 	}
 
-	strncpy(runnode->disk, content, strlen(content));
+	pnodes = obj->nodesetval;
+	if(pnodes->nodeNr <= 0) {
+		goto err;
+	}
+
+	site->node_num = pnodes->nodeNr;
+	site->nodes = malloc(site->node_num * sizeof(struct node_config));
+	memset(site->nodes, 0, site->node_num * sizeof(struct node_config));
+
+	for(i = 0; i < site->node_num; i++) {
+		if (get_node(ctx, cfg, idx, i) < 0)
+			goto err_node;
+	}
+
+	xmlXPathFreeObject(obj);
+	return 0;
+
+err_node:
+	if (site->nodes) {
+		free(site->nodes);
+		site->nodes = NULL;
+	}
+err:
+	xmlXPathFreeObject(obj);
+	return -1;
+}
+
+
+int get_sites(xmlXPathContextPtr ctx, struct config *cfg)
+{
+	xmlXPathObjectPtr obj;
+	xmlNodeSetPtr psites;
+	int i;
+
+	obj = exec_xpath_expr(ctx, SITE);
+	if(obj == NULL){
+		return -1;
+	}
+
+	psites = obj->nodesetval;
+	if(psites->nodeNr <= 0) {
+		goto err;
+	}
+
+	cfg->site_num = psites->nodeNr;
+	cfg->sites = malloc(cfg->site_num * sizeof(struct site_config));
+	memset(cfg->sites, 0, cfg->site_num * sizeof(struct site_config));
+
+	for(i = 0; i < cfg->site_num; i++) {
+		if (get_site(ctx, cfg, i) < 0)
+			goto err_site;
+		cfg->node_num += cfg->sites[i].node_num;
+	}
+
+	xmlXPathFreeObject(obj);
+	return 0;
+
+err_site:
+	if(cfg->sites) {
+		free(cfg->sites);
+		cfg->sites = NULL;
+	}
+
+err:
+	xmlXPathFreeObject(obj);
+	return -1;
+}
+
+int get_runsite(xmlXPathContextPtr ctx, struct config *cfg, int res_index, int runsite_index)
+{
+	xmlXPathObjectPtr obj;
+	xmlNodeSetPtr pnodes;
+	char expr[MAX_EXPR_LEN];
+	struct res_config *res;
+	struct runsite_config *runsite;
+	char *content;
+	int i;
+
+	res = &cfg->res[res_index];
+	runsite = &res->runsites[runsite_index];
+
+	memset(expr, 0, sizeof(expr));
+	snprintf(expr, sizeof(expr), RUNSITE_ID, res_index + 1, runsite_index + 1);
+	content = get_content(ctx, expr);
+	if(content == NULL) {
+		return -1;
+	}
+
+	runsite->id = atoi(content);
 	free(content);
 
 	memset(expr, 0, sizeof(expr));
-	snprintf(expr, sizeof(expr), RUNNODE_BWR_DISK, res_index + 1, runnode_index + 1);
+	snprintf(expr, sizeof(expr), RUNSITE_PROTO, res_index + 1, runsite_index + 1);
 	content = get_content(ctx, expr);
 	if(content == NULL) {
-		log_error("missing bwr name for runnode %d(res: %d).",
-				runnode->id, res->id);
 		return -1;
 	}
 
-	strncpy(runnode->bwr_disk, content, strlen(content));
+	if(!strncmp(content, ASYNC, strlen(ASYNC))) {
+		runsite->proto = PROTO_ASYNC;
+	} else if(!strncmp(content, SYNC, strlen(SYNC))) {
+		runsite->proto = PROTO_SYNC;
+	} else {
+		free(content);
+		return -1;
+	}
+
+	memset(expr, 0, sizeof(expr));
+	snprintf(expr, sizeof(expr), RUNSITE_DISK, res_index + 1, runsite_index + 1);
+	content = get_content(ctx, expr);
+	if(content == NULL) {
+		return -1;
+	}
+
+	strncpy(runsite->disk, content, strlen(content));
 	free(content);
 
+	memset(expr, 0, sizeof(expr));
+	snprintf(expr, sizeof(expr), RUNSITE_BWR_DISK, res_index + 1, runsite_index + 1);
+	content = get_content(ctx, expr);
+	if(content == NULL) {
+		return -1;
+	}
+
+	strncpy(runsite->bwr_disk, content, strlen(content));
+	free(content);
+
+	/* runsite ip */
+	memset(expr, 0, sizeof(expr));
+	snprintf(expr, sizeof(expr), RUNSITE_IPADDR, res_index + 1, runsite_index + 1);
+	content = get_content(ctx, expr);
+	if (content == NULL)
+		return -1;
+	strncpy(runsite->ipaddr, content, strlen(content));
+	free(content);
+
+	/* runsite port */
+	memset(expr, 0, sizeof(expr));
+	snprintf(expr, sizeof(expr), RUNSITE_PORT, res_index + 1, runsite_index + 1);
+	content = get_content(ctx, expr);
+	if (content == NULL)
+		return -1;
+	strncpy(runsite->port, content, strlen(content));
+	free(content);
+
+	/* runnodes */
+	memset(expr, 0, sizeof(expr));
+	snprintf(expr, sizeof(expr), RUNNODE, res_index + 1, runsite_index + 1);
+	obj = exec_xpath_expr(ctx, expr);
+	if (obj == NULL)
+		return -1;
+	pnodes = obj->nodesetval;
+	if (pnodes->nodeNr <= 0)
+		goto err_free_xml_obj;
+	runsite->runnode_num = pnodes->nodeNr;
+	runsite->runnodes = calloc(runsite->runnode_num, sizeof(struct node_config));
+	if (runsite->runnodes == NULL)
+		goto err_free_xml_obj;
+	for (i = 0; i < runsite->runnode_num; i++) {
+		if (get_runnode(ctx, cfg, res_index, runsite_index, i) < 0)
+			goto err_free_runnodes;
+	}
+
 	return 0;
+
+err_free_runnodes:
+	free(runsite->runnodes);
+err_free_xml_obj:
+	xmlXPathFreeObject(obj);
+	return -1;
 }
 
-static int get_runnodes(xmlXPathContextPtr ctx, struct config *cfg, int index)
+int get_runsites(xmlXPathContextPtr ctx, struct config *cfg, int index)
 {
 	xmlXPathObjectPtr obj;
 	xmlNodeSetPtr pnodes;
@@ -413,41 +618,37 @@ static int get_runnodes(xmlXPathContextPtr ctx, struct config *cfg, int index)
 	res = &cfg->res[index];
 
 	memset(expr, 0, sizeof(expr));
-	snprintf(expr, sizeof(expr), RUNNODE, index + 1);
+	snprintf(expr, sizeof(expr), RUNSITE, index + 1);
 	obj = exec_xpath_expr(ctx, expr);
 	if(obj == NULL){
-		log_error("missing runnodes for resource %d in config file.",
-				res->id);
 		return -1;
 	}
 
 	pnodes = obj->nodesetval;
 	if(pnodes->nodeNr <= 0) {
-		log_error("runnode numbers must larger than 0 (res: %d)",
-				res->id);
 		goto err;
 	}
 
-	res->runnode_num = pnodes->nodeNr;
-	res->runnodes = malloc(res->runnode_num * sizeof(struct runnode_config));
-	if(res->runnodes == NULL) {
+	res->runsite_num = pnodes->nodeNr;
+	res->runsites = malloc(res->runsite_num * sizeof(struct runsite_config));
+	if(res->runsites == NULL) {
 		goto err;
 	}
-	memset(res->runnodes, 0, res->runnode_num * sizeof(struct runnode_config));
+	memset(res->runsites, 0, res->runsite_num * sizeof(struct runsite_config));
 
-	for(i = 0; i < res->runnode_num; i++) {
-		if(get_runnode(ctx, cfg, index, i) < 0) {
-			goto err_runnode;
+	for(i = 0; i < res->runsite_num; i++) {
+		if(get_runsite(ctx, cfg, index, i) < 0) {
+			goto err_runsite;
 		}
 	}
 
 	xmlXPathFreeObject(obj);
 	return 0;
 
-err_runnode:
-	if(res->runnodes != NULL) {
-		free(res->runnodes);
-		res->runnodes = NULL;
+err_runsite:
+	if(res->runsites != NULL) {
+		free(res->runsites);
+		res->runsites = NULL;
 	}
 
 err:
@@ -455,7 +656,7 @@ err:
 	return -1;
 }
 
-static int get_res(xmlXPathContextPtr ctx, struct config *cfg, int index)
+int get_res(xmlXPathContextPtr ctx, struct config *cfg, int index)
 {
 	struct res_config *res;
 	char *content;
@@ -468,7 +669,6 @@ static int get_res(xmlXPathContextPtr ctx, struct config *cfg, int index)
 
 	content = get_content(ctx, expr);
 	if(content == NULL) {
-		log_error("missing resource id in config file.");
 		goto err;
 	}
 	res->id = atoi(content);
@@ -479,14 +679,12 @@ static int get_res(xmlXPathContextPtr ctx, struct config *cfg, int index)
 
 	content = get_content(ctx, expr);
 	if(content == NULL) {
-		log_error("missing resource name for resource %d in config file.",
-				res->id);
 		goto err;
 	}
 	strncpy(res->name, content, strlen(content));
 	free(content);
 
-	if(get_runnodes(ctx, cfg, index) < 0) {
+	if(get_runsites(ctx, cfg, index) < 0) {
 		goto err;
 	}
 
@@ -496,7 +694,7 @@ err:
 	return -1;
 }
 
-static int get_resources(xmlXPathContextPtr ctx, struct config *cfg)
+int get_resources(xmlXPathContextPtr ctx, struct config *cfg)
 {
 	xmlXPathObjectPtr obj;
 	xmlNodeSetPtr pnodes;
@@ -540,216 +738,6 @@ err:
 	return -1;
 }
 
-static int trim_nonlocal_res(struct config *cfg)
-{
-        int ridx, nidx, non_locals;
-        struct res_config *res, *res_iter;
-        struct runnode_config *node;
-		int i = 0;
-
-        non_locals = 0;
-        res = malloc(sizeof(struct res_config) * cfg->res_num);
-        if (res == NULL) {
-                log_error("error: not enough memory!");
-                return -1;
-        }
-        memset(res, 0, sizeof(struct res_config) * cfg->res_num);
-
-        for (ridx = 0; ridx < cfg->res_num; ridx++) {
-                res_iter = &cfg->res[ridx];
-                for (nidx = 0; nidx < res_iter->runnode_num; nidx++) {
-                        node = &res_iter->runnodes[nidx];
-                        if (node->id == cfg->local_node_id)
-                                break;
-                }
-
-                if (nidx < res_iter->runnode_num) {
-                        memcpy(&res[i++], res_iter, sizeof(struct res_config));
-                }
-                else {
-                        non_locals++;
-                }
-        }
-
-        free(cfg->res);
-        cfg->res = res;
-        cfg->res_num -= non_locals;
-        return 0;
-}
-
-char *trim(const char *str)
-{
-	char *res;
-	int len;
-	int i;
-	int j;
-
-	len = strlen(str);
-	res = malloc(len + 1);
-	if(res == NULL) {
-		return NULL;
-	}
-	memset(res, 0, len + 1);
-
-	for(i = 0, j = 0; i < len; i++) {
-		if(!isspace(str[i])) {
-			res[j++] = str[i];
-		}
-	}
-
-	return res;
-}
-
-struct config *alloc_config()
-{
-	struct config *cfg;
-
-	cfg = malloc(sizeof(struct config));
-	if(cfg == NULL) {
-		return NULL;
-	}
-
-	memset(cfg, 0, sizeof(struct config));
-
-	return cfg;
-}
-
-void free_config(struct config *cfg)
-{
-	int i;
-	struct res_config *res;
-
-	if(cfg->nodes != NULL) {
-		free(cfg->nodes);
-	}
-
-	if(cfg->res != NULL) {
-		for(i = 0; i < cfg->res_num; i++) {
-			res = &cfg->res[i];
-			if(res->runnodes != NULL) {
-				free(res->runnodes);
-			}
-		}
-
-		free(cfg->res);
-	}
-}
-
-static int get_local_node_id(struct config *cfg)
-{
-	struct node_config *node_cfg;
-	char hostname[MAX_HOSTNAME_LEN];
-	int idx;
-	int ret;
-
-	memset(hostname, 0, sizeof(hostname));
-
-	ret = gethostname(hostname, sizeof(hostname));
-	if(ret < 0) {
-		return -1;
-	}
-
-	for(idx = 0; idx < cfg->node_num; idx++) {
-		node_cfg = &cfg->nodes[idx];
-
-		if(!strcmp(hostname, node_cfg->hostname)) {
-			return idx;
-		}
-	}
-
-	return -1;
-}
-
-/* IFF cfg->local_node_id valid */
-static int get_local_server_idx(struct config *cfg)
-{
-	int idx;
-	struct node_config *local_node;
-	struct server_config *scfg;
-
-	local_node = &cfg->nodes[cfg->local_node_id];
-	for (idx = 0; idx < cfg->server_num; idx++) {
-		scfg = &cfg->servers[idx];
-		if (scfg->id == local_node->server_id)
-			return idx;
-	}
-
-	return -1;
-}
-
-struct config *load_config(const char *filename)
-{
-	xmlDocPtr doc;
-	xmlXPathContextPtr ctx;
-	struct config *cfg;
-	int local_node_id;
-	int local_server_idx;
-
-	doc = xmlParseFile(filename);
-	if(doc == NULL) {
-		return NULL;
-	}
-
-	ctx = xmlXPathNewContext(doc);
-	if(ctx == NULL) {
-		xmlFreeDoc(doc);
-		return NULL;
-	}
-
-	cfg = alloc_config();
-	if(cfg == NULL) {
-		goto err;
-	}
-
-	if(get_global(ctx, cfg) < 0) {
-		goto err_config;
-	}
-
-	if (get_servers(ctx, cfg) < 0) {
-		goto err_config;
-	}
-
-	if(get_nodes(ctx, cfg) < 0) {
-		goto err_config;
-	}
-
-	if(get_resources(ctx, cfg) < 0) {
-		goto err_config;
-	}
-
-	local_node_id = get_local_node_id(cfg);
-	if(local_node_id < 0) {
-		log_error("cannot find local node id");
-		goto err_config;
-	}
-	cfg->local_node_id = local_node_id;
-
-	local_server_idx = get_local_server_idx(cfg);
-	if (local_server_idx < 0) {
-		log_error("cannot find local server id");
-		goto err_config;
-	}
-	cfg->local_server_idx = local_server_idx;
-
-        if (trim_nonlocal_res(cfg) < 0) {
-                goto err_config;
-        }
-
-	xmlXPathFreeContext(ctx);
-	xmlFreeDoc(doc);
-
-	return cfg;
-
-err_config:
-	free_config(cfg);
-
-err:
-	xmlXPathFreeContext(ctx);
-	xmlFreeDoc(doc);
-
-	return NULL;
-}
-
 int align_packet_size(int size)
 {
 	if(size & ~BLK_MASK) {
@@ -761,46 +749,32 @@ int align_packet_size(int size)
 
 int get_conf_packet_size(struct config *cfg)
 {
+	struct site_config *site;
 	struct res_config *res;
 	int size;
-	int i;
+	int i, j;
 
 	size = sizeof(struct conf_packet);
-	size += cfg->node_num * sizeof(struct node_conf_packet);
-	size += cfg->server_num * sizeof(struct server_config);
+	size += cfg->site_num * sizeof(struct site_conf_packet);
 	size += cfg->res_num * sizeof(struct res_conf_packet);
+
+	for(i = 0; i < cfg->site_num; i++) {
+		site = &cfg->sites[i];
+		size += site->node_num * sizeof(struct node_conf_packet);
+	}
 
 	for(i = 0; i < cfg->res_num; i++) {
 		res = &cfg->res[i];
-		size += res->runnode_num * sizeof(struct runnode_conf_packet);
+		size += res->runsite_num * sizeof(struct runsite_conf_packet);
+		for (j = 0; j < res->runsite_num; j++) {
+			struct runsite_config *runsite;
+
+			runsite = &res->runsites[j];
+			size += runsite->runnode_num * sizeof(struct node_conf_packet);
+		}
 	}
 
 	return align_packet_size(size);
-}
-
-struct conf_packet *alloc_conf_packet_for_res(struct config *cfg,
-		struct res_config *res)
-{
-	struct conf_packet *conf_pkt;
-	int len;
-
-	len = sizeof(struct conf_packet);
-	len += cfg->node_num * sizeof(struct node_conf_packet);
-	len += cfg->server_num * sizeof(struct server_config);
-	len += sizeof(struct res_conf_packet);
-	len += res->runnode_num * sizeof(struct runnode_conf_packet);
-
-	len = align_packet_size(len);
-
-	conf_pkt = malloc(len);
-	if(conf_pkt == NULL) {
-		return NULL;
-	}
-
-	memset(conf_pkt, 0, len);
-	conf_pkt->len = len;
-
-	return conf_pkt;
 }
 
 struct conf_packet *alloc_conf_packet(struct config *cfg)
@@ -826,19 +800,29 @@ void free_conf_packet(struct conf_packet *conf_pkt)
 	free(conf_pkt);
 }
 
-static void pack_runnode(struct runnode_conf_packet *runnode_conf_pkt,
-			 struct runnode_config *runnode_cfg)
+void pack_site(struct site_conf_packet *site_conf_pkt, struct site_config *site_cfg)
 {
-	runnode_conf_pkt->id = runnode_cfg->id;
-	runnode_conf_pkt->proto = runnode_cfg->proto;
-	strncpy(runnode_conf_pkt->disk, runnode_cfg->disk, strlen(runnode_cfg->disk));
-	strncpy(runnode_conf_pkt->bwr_disk, runnode_cfg->bwr_disk, strlen(runnode_cfg->bwr_disk));
+	site_conf_pkt->id = site_cfg->id;
+	memcpy(site_conf_pkt->sitename, site_cfg->sitename, MAX_HOSTNAME_LEN);
+	site_conf_pkt->mode = site_cfg->mode;
+	site_conf_pkt->node_num = site_cfg->node_num;
 }
 
-static void pack_res(struct res_conf_packet *res_conf_pkt, struct res_config *res)
+void pack_runsite(struct runsite_conf_packet *runsite_conf_pkt, struct runsite_config *runsite_cfg)
+{
+	runsite_conf_pkt->id = runsite_cfg->id;
+	runsite_conf_pkt->proto = runsite_cfg->proto;
+	runsite_conf_pkt->runnode_num = runsite_cfg->runnode_num;
+	strncpy(runsite_conf_pkt->ipaddr, runsite_cfg->ipaddr, strlen(runsite_cfg->ipaddr));
+	strncpy(runsite_conf_pkt->port, runsite_cfg->port, strlen(runsite_cfg->port));
+	strncpy(runsite_conf_pkt->disk, runsite_cfg->disk, strlen(runsite_cfg->disk));
+	strncpy(runsite_conf_pkt->bwr_disk, runsite_cfg->bwr_disk, strlen(runsite_cfg->bwr_disk));
+}
+
+void pack_res(struct res_conf_packet *res_conf_pkt, struct res_config *res)
 {
 	res_conf_pkt->id = res->id;
-	res_conf_pkt->runnode_num = res->runnode_num;
+	res_conf_pkt->runsite_num = res->runsite_num;
 	res_conf_pkt->data_len = res->data_len;
 	res_conf_pkt->meta_offset = res->meta_offset;
 	res_conf_pkt->dbm_offset = res->dbm_offset;
@@ -846,143 +830,220 @@ static void pack_res(struct res_conf_packet *res_conf_pkt, struct res_config *re
 	strncpy(res_conf_pkt->name, res->name, strlen(res->name));
 }
 
-static void pack_node(struct node_conf_packet *node_conf_pkt,
-		      struct node_config *node_cfg)
+void pack_node(struct node_conf_packet *node_conf_pkt, struct node_config *node_cfg)
 {
 	node_conf_pkt->id = node_cfg->id;
-	node_conf_pkt->server_id = node_cfg->server_id;
 	strncpy(node_conf_pkt->hostname, node_cfg->hostname, strlen(node_cfg->hostname));
+	strncpy(node_conf_pkt->ipaddr, node_cfg->ipaddr, strlen(node_cfg->ipaddr));
+	strncpy(node_conf_pkt->port, node_cfg->port, strlen(node_cfg->port));
 }
 
-static void pack_server(struct server_conf_packet *server_conf_pkt,
-		      struct server_config *server_cfg)
-{
-	server_conf_pkt->id = server_cfg->id;
-	strncpy(server_conf_pkt->localipaddr, server_cfg->localipaddr, MAX_IPADDR_LEN);
-	strncpy(server_conf_pkt->remoteipaddr, server_cfg->remoteipaddr, MAX_IPADDR_LEN);
-	strncpy(server_conf_pkt->localport, server_cfg->localport, MAX_PORT_LEN);
-	strncpy(server_conf_pkt->remoteport, server_cfg->remoteport, MAX_PORT_LEN);
-}
-
-struct conf_packet *pack_config_for_res(struct config *cfg, struct res_config *res)
-{
-	struct conf_packet *conf_pkt;
-	struct node_config *node_cfg;
-	struct server_config *server_cfg;
-	struct runnode_config *runnode_cfg;
-	struct node_conf_packet *node_conf_pkt;
-	struct server_conf_packet *server_conf_pkt;
-	struct res_conf_packet *res_conf_pkt;
-	struct runnode_conf_packet *runnode_conf_pkt;
-	int i;
-
-	conf_pkt = alloc_conf_packet_for_res(cfg, res);
-	if(conf_pkt == NULL) {
-		return NULL;
-	}
-
-	strncpy(conf_pkt->kmodport, cfg->kmodport, strlen(cfg->kmodport));
-	conf_pkt->ping = cfg->ping;
-	conf_pkt->pingtimeout = cfg->pingtimeout;
-	conf_pkt->node_num = cfg->node_num;
-	conf_pkt->server_num = cfg->server_num;
-	conf_pkt->res_num = 1;
-	conf_pkt->local_server_id = cfg->servers[cfg->local_server_idx].id;
-	conf_pkt->local_node_id = cfg->nodes[cfg->local_node_id].id;
-
-	/* servers */
-	server_conf_pkt = (struct server_conf_packet *)conf_pkt->data;
-	for (i = 0; i < cfg->server_num; i++) {
-		server_cfg = &cfg->servers[i];
-		pack_server(server_conf_pkt, server_cfg);
-		server_conf_pkt++;
-	}
-
-	/* kmod nodes */
-	node_conf_pkt = (struct node_conf_packet *)server_conf_pkt;
-	for (i = 0; i < cfg->node_num; i++) {
-		node_cfg = &cfg->nodes[i];
-		pack_node(node_conf_pkt, node_cfg);
-		node_conf_pkt++;
-	}
-
-	res_conf_pkt = (struct res_conf_packet *)node_conf_pkt;
-	pack_res(res_conf_pkt, res);
-
-	runnode_conf_pkt = (struct runnode_conf_packet *)res_conf_pkt->data;
-	for(i = 0; i < res->runnode_num; i++) {
-		runnode_cfg = &res->runnodes[i];
-
-		pack_runnode(runnode_conf_pkt, runnode_cfg);
-		runnode_conf_pkt++;
-	}
-
-	return conf_pkt;
-}
-
+/*
+ * 打包结构的按照配置文件的结构进行打包
+ *
+ * 1. global
+ * 2. sites
+ * 3. resources
+ *
+ * 其中，sites 和 resources 里面嵌入了其他的内容。site 下面有 node，resource 下
+ * 面有 runsites,runsite 下面有 runnode。
+ *
+ * 一个包的平坦结构如下：
+ *
+ * serverip: 127.0.0.1
+ * serverport: 9999
+ * kmodport: 13527
+ * pingtimeout: 10
+ * maxpingcount: 10
+ * site_num: 2
+ * node_num: 2
+ * res_num: 2
+ * local_site_id: 0
+ * local_node_id: 0
+ *
+ * 接下来，是 sites 的内容
+ *
+ * id: 0
+ * mode: SYNC
+ * sitename: site[0]
+ * node_num: 2
+ *
+ * 接下来，是 site0 里面的 2 个节点的内容：
+ *
+ * id: 0
+ * hostname: u154
+ * ipaddr: 192.168.10.154
+ * port: 8811
+ *
+ * id: 1
+ * hostname: u155
+ * ipaddr: 192.168.10.155
+ * port: 8811
+ *
+ * 然后，重复是 site 的内容，打包完 site 的内容之后，接着是 resource 的内容：
+ *
+ * id: 0
+ * name: hadm0
+ * data_len: 44327843275
+ * meta_offset: 1234987
+ * dbm_offset: 4234
+ * dbm_size: 4312
+ *
+ * 接下来，是 resource 里面的 runsite 内容：
+ *
+ * id: 0
+ * proto: SYNC
+ * ipaddr: 192.168.10.10
+ * port: 8811
+ * disk: /dev/hadm/bdev0
+ * bwr_disk: /dev/hadm/bwr0
+ * runnode_num: 2
+ *
+ * 接下来，是 runsite 里面 runnode 的内容：
+ *
+ * id: 0
+ * hostname: u154
+ * ipaddr: 192.168.10.154
+ * port: 8811
+ *
+ * id: 1
+ * hostname: u155
+ * ipaddr: 192.168.10.155
+ * port: 8811
+ *
+ * 接下来，是另外一个 runsite 的内容：
+ *
+ * id: 1
+ * proto: SYNC
+ * ipaddr: 192.168.10.20
+ * port: 8811
+ * disk: /dev/hadm/bdev0
+ * bwr_disk: /dev/hadm/bwr0
+ * runnode_num:2
+ *
+ * 接下来，是这个 runsite 里面 runnode 的内容：
+ *
+ * id: 0
+ * hostname: u156
+ * ipaddr: 192.168.10.156
+ * port: 8811
+ *
+ * 接下来，重复 resource 的内容。
+ *
+ * 整个打包就结束了。
+ */
 struct conf_packet *pack_config(struct config *cfg)
 {
-	struct conf_packet *conf_pkt;
-	struct server_conf_packet *server_conf_pkt;
-	struct server_config *server_cfg;
+	struct site_config *site_cfg;
 	struct node_config *node_cfg;
 	struct res_config *res;
-	struct runnode_config *runnode_cfg;
+	struct runsite_config *runsite_cfg;
+	struct conf_packet *conf_pkt;
+	struct site_conf_packet *site_conf_pkt;
 	struct node_conf_packet *node_conf_pkt;
 	struct res_conf_packet *res_conf_pkt;
-	struct runnode_conf_packet *runnode_conf_pkt;
-	int i;
-	int j;
+	struct runsite_conf_packet *runsite_conf_pkt;
+	struct node_conf_packet *runnode_conf_pkt;
+	int i, j, k;
 
 	conf_pkt = alloc_conf_packet(cfg);
 	if(conf_pkt == NULL) {
 		return NULL;
 	}
 
-	/* global */
+	strncpy(conf_pkt->serverip, cfg->serverip, strlen(cfg->serverip));
+	strncpy(conf_pkt->serverport, cfg->serverport, strlen(cfg->serverport));
 	strncpy(conf_pkt->kmodport, cfg->kmodport, strlen(cfg->kmodport));
-	conf_pkt->ping = cfg->ping;
+	conf_pkt->maxpingcount = cfg->maxpingcount;
 	conf_pkt->pingtimeout = cfg->pingtimeout;
-	conf_pkt->server_num = cfg->server_num;
+	conf_pkt->site_num = cfg->site_num;
 	conf_pkt->node_num = cfg->node_num;
 	conf_pkt->res_num = cfg->res_num;
-	conf_pkt->local_server_id = cfg->servers[cfg->local_server_idx].id;
-	conf_pkt->local_node_id = cfg->nodes[cfg->local_node_id].id;
+	conf_pkt->local_site_id = cfg->local_site_id;
+	conf_pkt->local_node_id = cfg->local_node_id;
 
-	/* servers */
-	server_conf_pkt = (struct server_conf_packet *)conf_pkt->data;
-	for (i = 0; i < cfg->server_num; i++) {
-		server_cfg = &cfg->servers[i];
-		pack_server(server_conf_pkt, server_cfg);
-		server_conf_pkt++;
-	}
+	site_conf_pkt = (struct site_conf_packet *)conf_pkt->data;
 
-	/* kmod nodes */
-	node_conf_pkt = (struct node_conf_packet *)server_conf_pkt;
-	for (i = 0; i < cfg->node_num; i++) {
-		node_cfg = &cfg->nodes[i];
-		pack_node(node_conf_pkt, node_cfg);
-		node_conf_pkt++;
-	}
+	for(i = 0; i < cfg->site_num; i++) {
+		site_cfg = &cfg->sites[i];
 
-	/* resources */
-	res_conf_pkt = (struct res_conf_packet *)node_conf_pkt;
-	for(i = 0; i < cfg->res_num; i++) {
-		res = &cfg->res[i];
-		pack_res(res_conf_pkt, res);
+		pack_site(site_conf_pkt, site_cfg);
 
-		/* runnodes */
-		runnode_conf_pkt = (struct runnode_conf_packet *)res_conf_pkt->data;
-		for(j = 0; j < res->runnode_num; j++) {
-			runnode_cfg = &res->runnodes[j];
-			pack_runnode(runnode_conf_pkt, runnode_cfg);
-                        runnode_conf_pkt++;
+		node_conf_pkt = (struct node_conf_packet *)site_conf_pkt->data;
+		for (j = 0; j < site_cfg->node_num; j++) {
+			node_cfg = &site_cfg->nodes[j];
+
+			pack_node(node_conf_pkt, node_cfg);
+			node_conf_pkt++;
 		}
 
-		res_conf_pkt = (struct res_conf_packet *)runnode_conf_pkt;
+		site_conf_pkt = (struct site_conf_packet *)node_conf_pkt;
+	}
+
+	res_conf_pkt = (struct res_conf_packet *)site_conf_pkt;
+
+	for(i = 0; i < cfg->res_num; i++) {
+		res = &cfg->res[i];
+
+		pack_res(res_conf_pkt, res);
+
+		runsite_conf_pkt = (struct runsite_conf_packet *)res_conf_pkt->data;
+		for(j = 0; j < res->runsite_num; j++) {
+			runsite_cfg = &res->runsites[j];
+
+			pack_runsite(runsite_conf_pkt, runsite_cfg);
+
+			runnode_conf_pkt = (struct node_conf_packet *)runsite_conf_pkt->data;
+			for (k = 0; k < runsite_cfg->runnode_num; k++) {
+				struct node_config *runnode_cfg;
+
+				runnode_cfg = &runsite_cfg->runnodes[k];
+				pack_node(runnode_conf_pkt, runnode_cfg);
+				runnode_conf_pkt++;
+			}
+
+			runsite_conf_pkt = (struct runsite_conf_packet *)runnode_conf_pkt;
+		}
+
+		res_conf_pkt = (struct res_conf_packet *)runsite_conf_pkt;
 	}
 
 	return conf_pkt;
+}
+
+int get_local_site_id(struct config *cfg, int *node_idp)
+{
+	struct site_config *site_cfg;
+	struct node_config *node_cfg;
+	char hostname[MAX_HOSTNAME_LEN];
+	int site_idx;
+	int node_idx;
+	int ret;
+
+	memset(hostname, 0, sizeof(hostname));
+
+	ret = gethostname(hostname, sizeof(hostname));
+	if(ret < 0) {
+		return -1;
+	}
+
+	for (site_idx = 0; site_idx < cfg->site_num; site_idx++) {
+		site_cfg = &cfg->sites[site_idx];
+		for(node_idx = 0; node_idx < site_cfg->node_num; node_idx++) {
+			node_cfg = &site_cfg->nodes[node_idx];
+
+			if(!strncmp(hostname, node_cfg->hostname,
+						strlen(hostname))) {
+				goto found;
+			}
+		}
+	}
+
+	return -1;
+found:
+	if (node_idp)
+		*node_idp = node_cfg->id;
+	return site_cfg->id;
 }
 
 struct res_config *find_res_by_name(const char *res_name, struct config *cfg)
@@ -993,215 +1054,10 @@ struct res_config *find_res_by_name(const char *res_name, struct config *cfg)
 	for(idx = 0; idx < cfg->res_num; idx++) {
 		res = &cfg->res[idx];
 
-		if(!strcmp(res_name, res->name)) {
+		if(!strncmp(res_name, res->name, strlen(res->name))) {
 			return res;
 		}
 	}
 
 	return NULL;
-}
-
-struct node_config *find_node_by_id(struct config *cfg, int id)
-{
-        int idx;
-
-        for (idx = 0; idx < cfg->node_num; idx++) {
-                if (cfg->nodes[idx].id == id)
-                        return &cfg->nodes[idx];
-        }
-
-        return NULL;
-}
-
-static struct node_config *find_node_by_name(struct config *cfg, char *hostname)
-{
-        int idx;
-
-        for (idx = 0; idx < cfg->node_num; idx++) {
-                if (!strcmp(cfg->nodes[idx].hostname, hostname)){
-                        return &cfg->nodes[idx];
-		}
-        }
-
-        return NULL;
-}
-
-struct node_config *find_node(struct config *cfg, char *argv[])
-{
-        int type;
-
-        type = argv[1] ? atoi(argv[1]) : 0;
-
-        switch(type) {
-                case 0:
-                        return find_node_by_id(cfg, atoi(argv[0]));
-                case 1:
-                        return find_node_by_name(cfg, argv[0]);
-                default:
-                        return NULL;
-        }
-}
-
-struct server_config *find_server_by_id(struct config *cfg, int id)
-{
-	int idx;
-	struct server_config *server_cfg;
-	if(id < 0){
-		return NULL;
-	}
-
-	for (idx = 0; idx < cfg->server_num; idx++) {
-		server_cfg = &cfg->servers[idx];
-		if (server_cfg->id == id)
-			return server_cfg;
-	}
-
-	return NULL;
-}
-
-struct node_config *get_local_node(struct config *cfg)
-{
-	int idx;
-        struct node_config *node;
-
-        for (idx = 0; idx < cfg->node_num; idx++) {
-                node = &cfg->nodes[idx];
-                if (cfg->local_node_id == node->id)
-                        return node;
-        }
-
-        return NULL;
-}
-
-char *get_node_ip(struct config *cfg, int node_id)
-{
-        return NULL;
-}
-
-char *get_server_ip(struct config *cfg, int id)
-{
-	int idx;
-	struct server_config *server;
-
-	for (idx = 0; idx < cfg->server_num; idx++) {
-		server = &cfg->servers[idx];
-		if (server->id == id)
-			return server->remoteipaddr;
-	}
-
-	return NULL;
-}
-
-int get_res_node_proto(struct res_config *res, int node_id)
-{
-        int idx;
-        struct runnode_config *node;
-
-        for (idx = 0; idx < res->runnode_num; idx++) {
-                node = &res->runnodes[idx];
-                if (node_id == node->id)
-			return node->proto;
-        }
-        return -1;
-}
-
-char *get_node_name(struct config *cfg, int node_id)
-{
-        int idx;
-        struct node_config *node;
-
-        for (idx = 0; idx < cfg->node_num; idx++) {
-                node = &cfg->nodes[idx];
-                if (node_id == node->id)
-                        return node->hostname;
-        }
-        return NULL;
-}
-
-void pr_global_config(struct config *c)
-{
-	printf("kmodport: %s\n", c->kmodport);;
-	printf("ping: %d\n", c->ping);
-	printf("pingtimeout: %d\n", c->pingtimeout);
-}
-
-void pr_server_config(struct server_config *s)
-{
-	printf("\tid: %d\n", s->id);
-	printf("\tlocalipaddr: %s\n", s->localipaddr);
-	printf("\tlocalport: %s\n", s->localport);
-	printf("\tremoteipaddr: %s\n", s->remoteipaddr);
-	printf("\tremoteport: %s\n", s->remoteport);
-}
-
-void pr_node_config(struct node_config *n)
-{
-	printf("\tid: %d\n", n->id);
-	printf("\tserver_id: %d\n", n->server_id);
-	printf("\thostname: %s\n", n->hostname);
-}
-
-void pr_runnode_config(struct runnode_config *r)
-{
-	printf("\t\tid: %d\n", r->id);
-	printf("\t\tproto: %s\n", r->proto == PROTO_SYNC ? "SYNC" : "ASYNC");
-	printf("\t\tdisk: %s\n", r->disk);
-	printf("\t\tbwr_disk: %s\n", r->bwr_disk);
-}
-
-void pr_res_config(struct res_config *r)
-{
-	int i;
-
-	printf("\tid: %d\n", r->id);
-	printf("\tname: %s\n", r->name);
-
-	printf("\trunnodes:\n");
-	for (i = 0; i < r->runnode_num; i++) {
-		struct runnode_config *runnode;
-
-		runnode = &r->runnodes[i];
-		pr_runnode_config(runnode);
-		printf("\n");
-	}
-}
-
-void pr_config(struct config *c)
-{
-        int i;
-
-        pr_global_config(c);
-	printf("\n");
-
-	/* servers */
-	printf("servers:\n");
-	for (i = 0; i < c->server_num; i++) {
-		struct server_config *s;
-
-		s = &c->servers[i];
-		pr_server_config(s);
-		printf("\n");
-	}
-	printf("\n");
-
-	/* kmod nodes */
-	printf("kmod nodes:\n");
-	for (i = 0; i < c->node_num; i++) {
-		struct node_config *n;
-
-		n = &c->nodes[i];
-		pr_node_config(n);
-		printf("\n");
-	}
-	printf("\n");
-
-	/* resources */
-	printf("resources:\n");
-	for (i = 0; i < c->res_num; i++) {
-		struct res_config *r;
-
-		r = &c->res[i];
-		pr_res_config(r);
-		printf("\n");
-	}
 }

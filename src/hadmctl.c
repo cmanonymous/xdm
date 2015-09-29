@@ -6,8 +6,6 @@ enum CMD_TYPE {
         P_VERSION,
         P__UP,
         P_DUMP,
-        P_DUMPBWR,
-        P_STARTKMOD,
 };
 
 #define MAX_LINE_LEN 4096
@@ -45,8 +43,8 @@ struct command subcommand[] = {
         [P_FORCEPRIMARY] = {P_FORCEPRIMARY, "forceprimary", do_forceprimary, do_forceprimary_usage},
         [P_FORCESECONDARY] = {P_FORCESECONDARY, "forcesecondary", do_forcesecondary, do_forcesecondary_usage},
         [P_DUMP] = {P_DUMP, "dump", do_dump, do_dump_usage},
-        [P_DUMPBWR] = {P_DUMPBWR, "dumpbwr", do_dumpbwr, do_dumpbwr_usage},
-        [P_STARTKMOD] = {P_STARTKMOD, "startkmod", do_startkmod, do_startkmod_usage},
+	[P_MASTER] = {P_MASTER, "master", do_master, do_master_usage},
+	[P_SLAVER] = {P_SLAVER, "slaver", do_slaver, do_slaver_usage},
 };
 
 int main(int argc, char *argv[])
@@ -54,6 +52,17 @@ int main(int argc, char *argv[])
         struct config *cfg;
         int fd;
         int ret;
+
+        /* everyone can use hadmctl [version|help] */
+        progname = basename(argv[0]);
+        if (argc == 1 || !strncmp(argv[1], "help", sizeof(argv[1]))) {
+                usage(progname);
+                return 0;
+        }
+        if (!strncmp(argv[1], "version", sizeof(argv[1]))) {
+                do_command(0, --argc, ++argv, NULL);
+                return 0;
+        }
 
         if(!check_root()) {
                 fprintf(stderr, "Not root user.\n");
@@ -66,34 +75,22 @@ int main(int argc, char *argv[])
                 return -ECMD_CONFIG_FAIL;
         }
 
-        progname = basename(argv[0]);
-
-        if(--argc <= 0) {
-                usage(progname);
-                return -ECMD_WRONG_USAGE;
-        }
-
         cfg = load_config(CONFIG_FILE);
         if(cfg == NULL) {
                 log_error("error: can not load config.");
                 return -ECMD_CONFIG_FAIL;
         }
 
-        if (strncmp(argv[1], "version", sizeof(argv[1])) &&
-            strncmp(argv[1], "dump", sizeof(argv[1])) &&
-            strncmp(argv[1], "dumpbwr", sizeof(argv[1])) &&
-            strncmp(argv[1], "startkmod", sizeof(argv[1])) &&
-            strncmp(argv[1], "help", sizeof(argv[1]))) {
+        if (strncmp(argv[1], "init", sizeof(argv[1])) &&
+            strncmp(argv[1], "dump", sizeof(argv[1]))) {
                 fd = connect_to_kern(cfg);
                 if(fd < 0) {
-			if (strncmp(argv[1], "init", sizeof(argv[1]))) {
-				log_error("error: connect the kernel failed.");
-				return -ECMD_NET_ERROR;
-			}
+                        log_error("error: connect the kernel failed.");
+                        return -ECMD_NET_ERROR;
                 }
         }
 
-        ret = do_command(fd, argc, ++argv, cfg);
+        ret = do_command(fd, --argc, ++argv, cfg);
 
         free_config(cfg);
 
@@ -119,7 +116,7 @@ struct command *find_cmd_by_name(const char *cmd, struct command *subcmd, int nu
                         continue;
                 }
 
-                if(!strcmp(cmd, subcmd[idx].cmd)){
+                if(!strncmp(cmd, subcmd[idx].cmd, strlen(subcmd[idx].cmd))) {
                         return &subcmd[idx];
                 }
         }
@@ -138,7 +135,7 @@ struct command *find_cmd_by_type(int type, struct command *subcmd)
 
 void usage(const char *progname)
 {
-        log_error(USAGE_FMT, progname,
+        fprintf(stderr, USAGE_FMT, progname,
                         "init", "initial the running environment",
                         "config", "load the config file",
                         "up", "activate the resource",
@@ -216,7 +213,7 @@ int do_command(int fd, int argc, char *argv[], struct config *cfg)
         return ret;
 }
 
-int get_status(struct config *cfg, struct res_config *res, struct packet **pkt)
+int get_status(int conn_fd, struct config *cfg, struct res_config *res, struct packet **pkt)
 {
         int ret;
         int fd;
@@ -231,12 +228,16 @@ int get_status(struct config *cfg, struct res_config *res, struct packet **pkt)
         temp_pkt->dev_id = res->id;
         temp_pkt->type = P_STATUS;
 
-        fd = connect_to_kern(cfg);
-        if(fd < 0) {
-                log_error("error: connect the kernel failed.");
-                free(temp_pkt);
-                return -ECMD_NET_ERROR;
-        }
+	if (conn_fd < 0) {
+		fd = connect_to_kern(cfg);
+		if(fd < 0) {
+			log_error("error: connect the kernel failed.");
+			free(temp_pkt);
+			return -ECMD_NET_ERROR;
+		}
+	} else {
+		fd = conn_fd;
+	}
 
         ret = packet_send(fd, temp_pkt);
         if (ret == -1) {
@@ -256,7 +257,7 @@ int get_status(struct config *cfg, struct res_config *res, struct packet **pkt)
         }
 
         *pkt = temp_pkt;
-        close(fd);
+	if (conn_fd < 0)
+		close(fd);
         return 0;
-
 }

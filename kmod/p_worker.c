@@ -2,13 +2,11 @@
 
 #include <linux/kthread.h>
 #include <linux/delay.h>
-#include <linux/sched.h>
-#include <linux/wait.h>
 
 #include "hadm_def.h"
 #include "hadm_struct.h"
 #include "hadm_device.h"
-#include "hadm_node.h"
+#include "hadm_site.h"
 #include "bio_handler.h"
 #include "hadm_bio.h"
 #include "bwr.h"
@@ -24,330 +22,196 @@
 
 extern struct hadm_struct *g_hadm;
 
-/* NOTE: don't use refcnt yet */
-void hadm_pack_node_free(struct hadm_pack_node	*node)
-{
-	if (IS_ERR_OR_NULL(node)) {
-		return;
-	}
-	if (atomic_dec_and_test(&node->refcnt)) {
-		if (node->pack)
-			kfree(node->pack);
-		kfree(node);
-	}
-}
-
-struct hadm_pack_node *hadm_pack_node_alloc(void)
-{
-	struct hadm_pack_node *n;
-
-	n = kzalloc(sizeof(struct hadm_pack_node), GFP_KERNEL);
-
-	return n;
-}
-
-void hadm_pack_node_init(struct hadm_pack_node *node,struct packet *pack,struct socket *sock)
-{
-	INIT_LIST_HEAD(&node->q_node);
-	atomic_set(&node->refcnt, 1);
-	node->pack=pack;
-	node->sock=sock;
-}
-
-void hadm_pack_node_get(struct hadm_pack_node  *node)
-{
-	atomic_inc(&node->refcnt);
-}
-
-struct hadm_pack_node *hadm_pack_node_create(struct packet *pack,struct socket *sock)
-{
-	struct hadm_pack_node *node;
-	node=hadm_pack_node_alloc();
-	if(!IS_ERR_OR_NULL(node)){
-		hadm_pack_node_init(node, pack, sock);
-	}
-	return node;
-}
-
-struct hadm_pack_node *hadm_pack_node_clone(struct hadm_pack_node *node,int dev_id)
-{
-	struct hadm_pack_node *clone_node;
-	struct packet *clone_pack;
-	clone_pack = packet_alloc(node->pack->len, GFP_KERNEL);
-	if(IS_ERR_OR_NULL(clone_pack)) {
-		return NULL;
-	}
-	memcpy((void *)clone_pack,(void *)node->pack,sizeof(struct packet)+node->pack->len);
-	clone_pack->dev_id=dev_id;
-	clone_node = hadm_pack_node_create(clone_pack,node->sock);
-	if(IS_ERR_OR_NULL(clone_node)) {
-		packet_free(clone_pack);
-		return NULL;
-	}
-	return clone_node;
-}
-
 /* NOTE: 这个函数也没有处理队列被禁用的情况，因为不清除应该如何释放队列节点 */
-void hadm_receive_node(int p_type,struct hadm_pack_node *node)
+void hadm_receive_node(int p_type, struct hdpacket *node)
 {
 	int dev_id;
+	int handler_type;
 	struct hadm_queue *queue;
 	struct hadmdev *dev,*temp;
-	struct hadm_pack_node *clone_node;
-	dev_id = node->pack->dev_id;
+	struct hdpacket *clone_node;
+
+	dev_id = node->head.dev_id;
+	handler_type = hadmdev_packet_handler_type(p_type, &node->head);
+	if (handler_type < 0) {
+		pr_err("%s: can't find device handler for node(type:%d).\n",
+				__FUNCTION__, node->head.type);
+		return;
+	}
+
+	// FIXME read_lock? clone, push operation
 	read_lock(&g_hadm->dev_list_lock);
-	list_for_each_entry_safe(dev,temp,&g_hadm->dev_list,node) {
-		queue=dev->p_receiver_queue[p_type];
+	list_for_each_entry_safe(dev, temp, &g_hadm->dev_list, node) {
+		queue = dev->queues[handler_type];
 		if(dev_id == MAX_DEVICES ) {
-			clone_node = hadm_pack_node_clone(node,dev->minor);
-			if(IS_ERR_OR_NULL(clone_node)) {
+			clone_node = hdpacket_clone(node);
+			if (!clone_node)
 				continue;
-			}
-			hadm_queue_push(queue,&clone_node->q_node);
+			clone_node->head.dev_id = dev->minor;
+			hadm_queue_push(queue, &clone_node->list);
 		} else if (dev_id == dev->minor) {
-			hadm_queue_push(queue,&node->q_node);
+			hadm_queue_push(queue, &node->list);
 		}
 	}
 	read_unlock(&g_hadm->dev_list_lock);
+
 	if(dev_id == MAX_NODES) {
-		hadm_pack_node_free(node);
+		hdpacket_free(node);
 	}
 }
 
-uint32_t hadm_pack_queue_clean(struct hadm_queue *q)
+void hadm_pack_queue_clean(struct hadm_queue *q)
 {
-	struct hadm_pack_node *node;
+	struct hdpacket *node;
 	unsigned long flags;
-	int n = 0;
 
 	spin_lock_irqsave(&q->lock, flags);
+	if (q->len)
+		pr_info("%s: try clean unempty %s queue.(remain: %d)\n",
+				__FUNCTION__,
+				q->name, q->len);
 	while (q->len > 0) {
-		node = (struct hadm_pack_node *)__hadm_queue_pop_common(q);
-		hadm_pack_node_free(node);
-		n++;
+		node = __hadm_queue_pop_entry(q, struct hdpacket, list);
+		BUG_ON(!node);
+		hdpacket_free(node);
 	}
 	spin_unlock_irqrestore(&q->lock, flags);
-	return n;
 }
 
-void hadm_pack_queue_clean_for_host(struct hadm_queue *queue, struct hadm_node *host)
+void hadm_pack_queue_clean_for_host(struct hadm_queue *queue, struct hadm_site *host)
 {
-	struct hadm_pack_node *pack_iter, *tmp;
+	struct hdpacket *pack_iter;
+	struct hdpacket *tmp;
 
-	unsigned long flags;
-
-	spin_lock_irqsave(&queue->lock, flags);
-	list_for_each_entry_safe(pack_iter, tmp, &queue->head, q_node) {
-		if (pack_iter->pack->node_from == host->id || 
-				(pack_iter->pack->node_to & (1<<host->id))) {
-			list_del_init(&pack_iter->q_node);
+	spin_lock(&queue->lock);
+	list_for_each_entry_safe(pack_iter, tmp, &queue->head, list) {
+		if (pack_iter->head.node_from == host->id) {
+			list_del_init(&pack_iter->list);
 			queue->len--;
-			hadm_pack_node_free(pack_iter);
+			hdpacket_free(pack_iter);
 			if (waitqueue_active(&queue->push_waitqueue))
 				wake_up(&queue->push_waitqueue);
 		}
 	}
-	spin_unlock_irqrestore(&queue->lock, flags);
+	spin_unlock(&queue->lock);
 }
 
-int send_packet_node(struct socket *sock,struct hadm_pack_node *node)
-{
-	int ret = 0;
-	size_t packlen=PACKET_HDR_LEN+node->pack->len;
 
-	for (;;) {
-		ret = hadm_socket_send(sock, node->pack,packlen);
-		if (ret == packlen)
-			break;
-		if (ret == -EAGAIN) {
-			pr_err("hadm_net_send: send pack(%p) again\n", node->pack);
-			schedule();
-			continue;
-		} else if (ret < 0) {
-			pr_err("hadm_net_send failed: %d\n", ret);
-			return ret;
-		} else if (ret != packlen) {
-			pr_err("hadm_net_send failed: "
-				   "send=%d, want=%lu\n", ret, packlen);
-			return -EINVAL;
-		}
-	}
-	return 0;
-
-}
-
-struct hadm_pack_node *packet_node_receive(struct socket *sock,int *error)
-{
-	struct hadm_pack_node *node=NULL;
-	struct packet *pack=NULL,*data_pack=NULL;
-	size_t packlen;
-	int ret=0;
-	*error=0;
-	packlen=PACKET_HDR_LEN;
-	pack=kzalloc(packlen,GFP_KERNEL);
-	if(IS_ERR_OR_NULL(pack)){
-		*error=-ENOMEM;
-		return NULL;
-	}
-	ret=hadm_socket_receive(sock,(char *)pack,packlen);
 #if 0
-	if(sock != g_hadm->ctrl_net->sock && sock != g_hadm->data_net->sock) {
-		pr_info("hadm_socket_receive complete, ret=%d\n",ret);
-	}
-#endif
-	if(ret != packlen) {
-		*error=ret;
-		goto recv_done;
-	}
-	if (pack->magic != MAGIC) {
-		pr_err("ctrl_client_receive_node: wrong packet\n");
-		//dump_packet("receive_node", pack);
-		*error=-EINVAL;
-		goto recv_done;
-	}
+struct hdpacket *packet_node_receive(struct socket *sock, int *error)
+{
+	int ret;
+	uint32_t vcnt;
+	struct kvec *kv;
+	struct hvec *hv;
+	struct hdpacket *pack;
+	struct packet *head;
 
-	if(pack->len>0) {
-		packlen = PACKET_HDR_LEN + pack->len;
-		data_pack = kzalloc(packlen, GFP_KERNEL);
-		if(IS_ERR_OR_NULL(data_pack)) {
-			*error = -ENOMEM;
-			goto recv_done;
-		}
-		memcpy(data_pack, pack, PACKET_HDR_LEN);
-		ret = hadm_socket_receive(sock, (char *)data_pack->data, data_pack->len);
-		if(ret==data_pack->len){
-			kfree(pack);
-			pack = data_pack;
-		}
-		else {
-			kfree(data_pack);
-			if(ret<0) {
-				*error = ret;
-			}
-			else {
-				*error=-ENOTCONN;
-			}
-			goto recv_done;
-		}
-	}
-	node = hadm_pack_node_create(pack,sock);
-	if(IS_ERR_OR_NULL(node)) {
-		*error=-ENOMEM;
-		goto  recv_done;
-	}
-
-recv_done:
-	if(*error){
-		if(pack)
-			kfree(pack);
-		if(node)
-			kfree(node);
+	pack = hdpacket_alloc(GFP_KERNEL, 0, HADM_DATA_NORMAL);
+	if (!pack) {
+		ret = -ENOMEM;
+		pr_err("%s: ENOMEM.", __FUNCTION__);
 		return NULL;
 	}
-	return node;
-}
+	head = &pack->head;
 
+	ret = hadm_socket_receive(sock, (char *)head, PACKET_HDR_LEN);
+	if (ret != PACKET_HDR_LEN) {
+		pr_err("%s: recevice error %d.", __FUNCTION__, ret);
+		goto fail;
+	}
+
+	if (unlikely(head->magic != MAGIC)) {
+		pr_err("%s: wrong packet", __FUNCTION__);
+		//dump_packet("receive_node", pack);
+		ret = -EINVAL;
+		goto fail;
+	}
+
+	if (head->len) {
+		vcnt = div_round_up(head->len, PAGE_SIZE);
+		ret = hdpacket_hvmax_set(pack, vcnt);
+		if (ret < 0)
+			goto fail;
+
+		kv = kzalloc(sizeof(struct kvec) * (vcnt + 1), GFP_KERNEL);
+		if (!kv) {
+			ret = -ENOMEM;
+			goto fail;
+		}
+		hv = pack->hv;
+		while (vcnt--) {
+			kv[vcnt].iov_base = hvec_data_base(&hv[vcnt]);
+			kv[vcnt].iov_len = hv[vcnt].len;
+		}
+
+		ret = hadm_socket_recvv(sock, kv, pack->hv_cnt, head->len);
+		if (ret != head->len) {
+			goto fail;
+		}
+	}
+
+	return pack;
+
+fail:
+	if (error)
+		*error = ret;
+	hdpacket_free(pack);
+	return NULL;
+}
+#endif
+
+/* handle data/meta packet send by hadm_main server */
 int p_receiver_run(int p_type)
 {
 	struct hadm_net *net;
-	struct hadmdev *dev;
-	struct hadm_node *hadm_node;
 	struct hadm_thread *thread;
-	struct hadm_pack_node *node;
-	int error=0;
+	struct hdpacket *pack;
+	char name[MAX_NAME_LEN];
 
+	thread = g_hadm->p_receiver[p_type];
 	net = find_hadm_net_by_type(p_type);
-	thread=g_hadm->p_receiver[p_type];
-	while(hadm_thread_get_state(thread) == HADM_THREAD_RUN && !hadm_net_closed(net)) {
-		if(!hadm_net_connected(net)) {
+	if (!net) {
+		pr_err("%s: wrong type %d.", __FUNCTION__, p_type);
+		goto out;
+	}
+	snprintf(name, sizeof(name), "%s: ", p_type == P_CTRL_TYPE ? "CTRL" : "DATA");
+	/* FIXME: can more sophisticated? what if only one link disconnect */
+	while(hadm_thread_get_state(thread)==HADM_THREAD_RUN) {
+		if(!hadm_socket_has_connected(net)) {
+			pr_debug("%s_%s: net has not conneted.\n", __FUNCTION__, name);
 			msleep(1000);
 			continue;
 
 		}
+
 		if (get_hadm_net_socket(net) < 0) {
 			dump_stack();
 			continue;
 		}
 
 		while (hadm_thread_get_state(thread) == HADM_THREAD_RUN) {
-			node = packet_node_receive(net->sock, &error);
-			if (node) {
-				hadm_receive_node(p_type, node);
-			} else {
-				if(hadm_net_closed(net)) {
-					break;
-				}
-				if(error != -EAGAIN && error != -EINTR &&
-						error != -ERESTARTSYS) {
-					pr_err("receive %s data failed,error:%d\n",
-							(p_type==P_CTRL_TYPE)?"CTRL":"DATA",
-							error);
-
-					break;
-				}
+			pack = hdpacket_recv(net->sock);
+			if (!pack) {
+				pr_err("%s: receive %s data failed.\n", __FUNCTION__,
+						p_type == P_CTRL_TYPE ? "CTRL":"DATA");
+				break;
 			}
+
+			//dump_packet(__FUNCTION__, &pack->head);
+			hadm_receive_node(p_type, pack);
 		}
-//		pr_info("close socket net %p , state = %d,  socket = %p, refcnt = %d\n", 
-//				net, net->cstate, net->sock, atomic_read(&net->refcnt));
+
 		hadm_net_close_socket(net);
-//		pr_info("socket net %p closed, state = %d,  socket = %p, refcnt = %d\n", 
-//				net, net->cstate, net->sock, atomic_read(&net->refcnt));
+		pr_err("%s: close %s socket: refcnt:%d\n", __FUNCTION__,
+				p_type == P_CTRL_TYPE ? "CTRL":"DATA", atomic_read(&net->refcnt));
 		if (net == g_hadm->ctrl_net) {
-			list_for_each_entry(dev, &g_hadm->dev_list, node) {
-				list_for_each_entry(hadm_node, &dev->hadm_node_list, node)
-					disconnect_node(hadm_node);
-			}
+			hadm_disconnect(g_hadm);
 		}
 	}
 
-	hadm_thread_terminate(thread);
-	//complete(&thread->ev_exit);
-	return 0;
-}
-/**
- *因为__p_fullsync_md5的io是异步实现的，无法在endio回调中计算md5,所以
- *在endio里将读到的内容写入到packet->data中，将原始包的md5写到pack->md5里
- *在发送之前比较md5的值，得到errcode
- */
-static void packet_pre_send(struct hadm_pack_node *node)
-{
-	char md5[16];
-	if(node->pack->type == P_FULLSYNC_DATA_REQ) {
-		fullsync_md5_hash(node->pack->data, PAGE_SIZE, md5);
-		node->pack->errcode = memcmp(md5, node->pack->md5, 16) ? -FULLSYNC_DATA_REQ : 0;
-		node->pack->len = 0 ;
-	}
-}
-
-int p_cmd_sender_run(void)
-{
-	struct hadm_thread *thread;
-	struct hadm_pack_node *node;
-	struct hadm_queue *queue;
-
-
-	thread = g_hadm->p_sender[P_CMD_TYPE];
-	queue = g_hadm->cmd_sender_queue;
-
-	while(hadm_thread_get_state(thread)==HADM_THREAD_RUN) {
-		node = (struct hadm_pack_node *)hadm_queue_pop_timeout(queue,
-				msecs_to_jiffies(1000));
-		if(IS_ERR_OR_NULL(node))
-			continue;
-		send_packet_node(node->sock, node);
-		hadm_socket_close(node->sock);
-		hadm_socket_release(node->sock);
-		hadm_pack_node_free(node);
-	}
-	spin_lock_irq(&queue->lock);
-	while (queue->len > 0) {
-		node = (struct hadm_pack_node *)__hadm_queue_pop_common(queue);
-		hadm_socket_close(node->sock);
-		hadm_socket_release(node->sock);
-		hadm_pack_node_free(node);
-	}
-	spin_unlock_irq(&queue->lock);
-	hadm_thread_terminate(thread);
+out:
+	complete(&thread->ev_exit);
 	return 0;
 }
 
@@ -356,153 +220,159 @@ int p_sender_run(int p_type)
 	int ret;
 	struct hadm_net *net;
 	struct hadm_thread *thread;
-	struct hadm_pack_node *node;
-	struct hadm_queue *queue, *tmp_queue;
-	struct hadmdev *dev;
-	unsigned long flags;
+	struct hdpacket *node;
+	struct hadm_queue *queue;
+	char name[MAX_NAME_LEN];
 
 	net = find_hadm_net_by_type(p_type);
 	if (IS_ERR(net)) {
 		pr_err("invalid packet type:%d\n", p_type);
 		return -1;
 	}
-	tmp_queue = hadm_queue_create("send_tmp_queue", MAX_QUEUE_LEN);
-	if(IS_ERR_OR_NULL(tmp_queue)){
-		return -1;
-	}
 
 	thread=g_hadm->p_sender[p_type];
+	queue=g_hadm->p_sender_queue[p_type];
+	snprintf(name, sizeof(name), "%s", p_type == P_CTRL_TYPE ? "CTRL" : "DATA");
 
 	while(hadm_thread_get_state(thread)==HADM_THREAD_RUN) {
-
 		/* 1. 检查网络是否正常 */
-		if(hadm_net_closed(net)) {
-			break;
-		}
-		if (!hadm_net_connected(net)) {
-			wake_up(&g_hadm->queue_event);
-			net->connect_type = (p_type == P_CTRL_TYPE)?
-				P_KERN_HANDSHAKE_M : P_KERN_HANDSHAKE_D;
-			if (hadm_connect_server(net) < 0) {
-				msleep(1500);
+		if (!hadm_socket_has_connected(net)) {
+			net->connect_type = (p_type==P_CTRL_TYPE)?P_KERN_HANDSHAKE_M:P_KERN_HANDSHAKE_D;
+			if (hadm_net_closed(net)) {
+				msleep(1000);
 				continue;
 			}
+			if (hadm_connect_server(net) < 0) {
+				pr_debug("%s_%s: connect server faild.\n", __FUNCTION__, name);
+				msleep(500);
+				continue;
+			}
+			pr_info("%s: connect to %s net success.\n", __FUNCTION__, name);
 		}
 
 		/* 2. 处理队列中的节点 */
-
 		while(hadm_thread_get_state(thread)==HADM_THREAD_RUN) {
-			if (net && !hadm_net_connected(net)) {
-				break;
-			}
-			if(wait_event_timeout(g_hadm->queue_event, 
-					atomic_read(&(g_hadm->sender_queue_size[p_type])) > 0,
-					msecs_to_jiffies(3000)) == 0)
-				continue;
-			read_lock_irqsave(&g_hadm->dev_list_lock, flags);
-			list_for_each_entry(dev, &g_hadm->dev_list, node) {
-				queue = dev->p_sender_queue[p_type];
-				node = (struct hadm_pack_node *)hadm_queue_pop_nowait(queue);
-				if(IS_ERR_OR_NULL(node))
-					continue;
-				hadm_queue_push(tmp_queue, &node->q_node);
-			}
-			read_unlock_irqrestore(&g_hadm->dev_list_lock, flags);
-			ret = 0;
-			while((node = (struct hadm_pack_node *)hadm_queue_pop_nowait(tmp_queue)) != NULL) {
-				packet_pre_send(node);
-				ret = send_packet_node(net->sock, node);
-				hadm_pack_node_free(node);
-				if(ret < 0) 
+			node = hadm_queue_pop_entry_timeout(queue, struct hdpacket,
+					list, msecs_to_jiffies(3000));
+			if (IS_ERR_OR_NULL(node)) {
+				if (!hadm_socket_has_connected(net))
 					break;
-				atomic_dec(&g_hadm->sender_queue_size[p_type]);
-				wake_up(&g_hadm->queue_event);
+				if (IS_ERR(node))	/* queue freezen */
+					msleep(500);
+				continue;
 			}
-			if(ret < 0) {
+
+			/* data_snd or ctrl_snd */
+			ret = hdpacket_send(net->sock, node);
+			if (ret < 0) {
+				pr_err("%s: send error :%d.\n", __FUNCTION__, ret);
 				break;
 			}
+			hdpacket_free(node);
 		}
-		hadm_net_close_socket(net);
 
+		hadm_net_close_socket(net);
+		pr_err("%s: close %s socket: refcnt:%d\n", __FUNCTION__,
+				p_type == P_CTRL_TYPE ? "CTRL":"DATA", atomic_read(&net->refcnt));
 	}
-	hadm_pack_queue_clean(tmp_queue);
-	hadm_queue_free(tmp_queue);
-	hadm_thread_terminate(thread);
-	//complete(&thread->ev_exit);
+
+	complete(&thread->ev_exit);
 	return 0 ;
 }
 
-packet_handler_t get_worker_functions(int p_type,int pack)
+/* p_data/ctrl_reciver() should sheck packet type */
+struct device_handler *get_worker_handler(int type)
 {
-	switch(p_type){
-		case P_CTRL_TYPE:return get_ctrl_worker_handler(pack);
-		case P_DATA_TYPE:return get_data_worker_handler(pack);
-		case P_CMD_TYPE:return get_cmd_worker_handler(pack);
-		default:return NULL;
+	struct device_handler *handler;
+
+	switch (type) {
+	case P_SITE_CTRL:
+		handler = get_site_ctrl_handler();
+		break;
+	case P_SITE_DATA:
+		handler = get_site_data_handler();
+		break;
+	case P_NODE_CTRL:
+		handler = get_node_ctrl_handler();
+		break;
+	case P_NODE_DATA:
+		handler = get_node_data_handler();
+		break;
+	default:
+		handler = NULL;
+		break;
 	}
-	return NULL;
+
+	return handler;
 }
 
-static int p_worker_run(int p_type,struct hadmdev *hadmdev)
+int cmd_worker_run(void *arg)
 {
-	struct hadm_thread *thread;
-	struct hadm_pack_node *node;
-	struct hadm_queue *queue;
-	packet_handler_t func;
+	struct hdpacket *node;
+	cmd_handler_t func;
+	struct hadm_thread *thr = g_hadm->cmd_worker;
+	struct hadm_queue *q = g_hadm->cmd_receiver_queue;
+	struct packet_handler *handler= get_cmd_handler();
 
-	switch(p_type) {
-		case P_CTRL_TYPE:
-			thread=hadmdev->worker_thread[p_type];
-			queue=hadmdev->p_receiver_queue[p_type];
-			break;
-		case P_DATA_TYPE:
-			thread=hadmdev->worker_thread[p_type];
-			queue=hadmdev->p_receiver_queue[p_type];
-			break;
-		case P_CMD_TYPE:
-			thread = g_hadm->cmd_worker;
-			queue = g_hadm->cmd_receiver_queue;
-			break;
-		default:
-			pr_err("invalid packet type:%d\n",p_type);
-			return -1;
+	BUG_ON(!thr || !q || !handler);
+
+	while (hadm_thread_get_state(thr) == HADM_THREAD_RUN) {
+		node = hadm_queue_pop_entry_timeout(q, struct hdpacket,
+				list, msecs_to_jiffies(3000));
+		if (!node)
+			continue;
+		if (IS_ERR(node)) {
+			/* right now, means queue frozen, check later */
+			msleep(3000);
+			continue;
+		}
+
+		func = handler[node->head.type].func;
+		if (func)
+			func(node);
+		hdpacket_free(node);
 	}
 
+	/* We need close/release socket, do it manual. */
+	spin_lock_irq(&q->lock);
+	while (q->len > 0) {
+		node = __hadm_queue_pop_entry(q, struct hdpacket, list);
+		hadm_socket_close(node->private);
+		hadm_socket_release(node->private);
+		hdpacket_free(node);
+	}
+	spin_unlock_irq(&q->lock);
+
+	complete(&thr->ev_exit);
+	return 0;
+}
+
+static int p_worker_run(struct hadm_queue *q, struct hadm_thread *thr,
+		struct device_handler *handler, struct hadmdev *dev)
+{
+	device_packet_handler_t func;
+	struct hdpacket *node;
+
+	BUG_ON(!q || !thr || !handler);
 	//pr_info("thread: %p(%s), queue: %p\n", thread, thread->name, queue);
 
-	while(hadm_thread_get_state(thread)==HADM_THREAD_RUN) {
-		for (;;) {
-			node = (struct hadm_pack_node *)hadm_queue_pop_timeout(queue, msecs_to_jiffies(3000));
-			if (IS_ERR(node)) {
-				schedule();
-				break;
-			} else if (node == NULL) { /* timeout */
-				continue;
-			}
-//			dump_packet(__FUNCTION__, node->pack);
-//			if(p_type == P_DATA_TYPE)
-//				dump_packet("", node->pack);
-			func = get_worker_functions(p_type, node->pack->type);
-			if (func)
-				func(node);
-			hadm_pack_node_free(node);
+	while(hadm_thread_get_state(thr)==HADM_THREAD_RUN) {
+		node = hadm_queue_pop_entry_timeout(q, struct hdpacket,
+				list, msecs_to_jiffies(3000));
+		if (!node)
+			continue;
+		if (IS_ERR(node)) {
+			msleep(3000);
+			break;
 		}
+
+		func = handler[node->head.type].func;
+		if (func)
+			func(dev, node);
+		hdpacket_free(node);
 	}
 
-	if (p_type == P_CMD_TYPE) {
-		/* We need close/release socket, do it manual. */
-		spin_lock_irq(&queue->lock);
-		while (queue->len > 0) {
-			node = (struct hadm_pack_node *)__hadm_queue_pop_common(queue);
-			hadm_socket_close(node->sock);
-			hadm_socket_release(node->sock);
-			hadm_pack_node_free(node);
-		}
-		spin_unlock_irq(&queue->lock);
-	}
-
-	hadm_thread_terminate(thread);
-	//complete(&thread->ev_exit);
+	complete(&thr->ev_exit);
 	return 0;
 }
 
@@ -516,30 +386,26 @@ static int __cmd_receiver(void *arg)
 {
 	struct cmd_client *client = (struct cmd_client *)arg;
 	struct socket *sock = client->sock;
-	struct hadm_pack_node *node;
+	struct hdpacket *node;
 	struct hadm_queue *queue = g_hadm->cmd_receiver_queue;
-	int ret, error;
+	int ret;
 
 	atomic_inc(client->client_num);
 
-	node=packet_node_receive(sock,&error);
+	node = hdpacket_recv(sock);
 	if (IS_ERR_OR_NULL(node)) {
-		//TODO: WARNING
 		hadm_socket_close(sock);
 		hadm_socket_release(sock);
 	} else {
-		ret = hadm_queue_push(queue, &node->q_node);
-		if(ret) {
-			pr_warn("%s :push data to cmd receiver queue failed\n", __FUNCTION__);
-		}
+		node->private = sock;
+		ret = hadm_queue_push(queue, &node->list);
 		if (ret == -EHADM_QUEUE_FREEZE) {
-			hadm_pack_node_free(node);
+			hdpacket_free(node);
 		}
 	}
 
-	atomic_dec(client->client_num);
-
 	complete(client->client_ev);
+	atomic_dec(client->client_num);
 	kfree(client);
 	return 0;
 }
@@ -560,9 +426,14 @@ int cmd_receiver_run(void *arg)
 	while (hadm_thread_get_state(thread) == HADM_THREAD_RUN) {
 		err = kernel_accept(sock, &cli_sock, 0);
 		if (err) {
+			if (err == -EINVAL) {
+				pr_info("%s: sock close.\n", __FUNCTION__);
+				break;
+			}
 			if (err != -EAGAIN && err != -EINTR && err != -ERESTARTSYS) {
 				//unexcept error,
 			}
+			pr_info("%s: recv err :%d.\n", __FUNCTION__, err);
 			continue;
 		}
 		client=kzalloc(sizeof(struct cmd_client),GFP_KERNEL);
@@ -586,20 +457,51 @@ int cmd_receiver_run(void *arg)
 		wait_for_completion(&client_ev);
 
 	}
-	hadm_thread_terminate(thread);
+	complete(&thread->ev_exit);
 	return 0;
 }
 
 int cmd_sender_run(void *arg)
 {
-	return p_cmd_sender_run();
-}
+	struct hdpacket *node;
+	struct socket *sock;
+	struct hadm_thread *thr = g_hadm->p_sender[P_CMD_TYPE];
+	struct hadm_queue *q = g_hadm->p_sender_queue[P_CMD_TYPE];
 
-int cmd_worker_run(void *arg)
-{
-	return p_worker_run(P_CMD_TYPE,NULL);
-}
+	while(hadm_thread_get_state(thr) == HADM_THREAD_RUN) {
+		node = hadm_queue_pop_entry_timeout(q, struct hdpacket,
+				list, msecs_to_jiffies(3000));
 
+		if (!node)
+			continue;
+		if (IS_ERR(node)) {
+			/* right now, means queue frozen, check later */
+			msleep(500);
+			continue;
+		}
+
+		sock = node->private;
+		hdpacket_send(sock, node);
+		hadm_socket_close(sock);
+		hadm_socket_release(sock);
+
+		hdpacket_free(node);
+	}
+
+	// We need close/release socket, do it manual.
+	spin_lock_irq(&q->lock);
+	while (q->len > 0) {
+		node = __hadm_queue_pop_entry(q, struct hdpacket, list);
+		sock = (struct socket *)node->private;
+		hadm_socket_close(sock);
+		hadm_socket_release(sock);
+		hdpacket_free(node);
+	}
+	spin_unlock_irq(&q->lock);
+
+	complete(&thr->ev_exit);
+	return 0 ;
+}
 
 int p_ctrl_sender_run(void *arg)
 {
@@ -621,12 +523,117 @@ int p_data_receiver_run(void *arg)
 	return p_receiver_run(P_DATA_TYPE);
 }
 
-int p_ctrl_worker_run(void *arg)
+int site_ctrl_worker(void *arg)
 {
-	return p_worker_run(P_CTRL_TYPE,(struct hadmdev *)arg);
+	struct hadmdev *dev = arg;
+
+	return p_worker_run(dev->queues[SITE_CTRL_Q],
+			dev->threads[SITE_CTRL_WORKER],
+			get_site_ctrl_handler(),
+			dev);
 }
 
-int p_data_worker_run(void *arg)
+int site_data_worker(void *arg)
 {
-	return p_worker_run(P_DATA_TYPE,(struct hadmdev *)arg);
+	struct hadmdev *dev = arg;
+
+	return p_worker_run(dev->queues[SITE_DATA_Q],
+			dev->threads[SITE_DATA_WORKER],
+			get_site_data_handler(),
+			dev);
+}
+
+int node_ctrl_worker(void *arg)
+{
+	struct hadmdev *dev = arg;
+
+	return p_worker_run(dev->queues[NODE_CTRL_Q],
+			dev->threads[NODE_CTRL_WORKER],
+			get_node_ctrl_handler(),
+			dev);
+}
+
+int node_data_worker(void *arg)
+{
+	struct hadmdev *dev = arg;
+
+	return p_worker_run(dev->queues[NODE_DATA_Q],
+			dev->threads[NODE_DATA_WORKER],
+			get_node_data_handler(),
+			dev);
+}
+
+int sbio_worker(void *arg)
+{
+	int ret;
+	struct hdpacket *pack;
+	struct hadmdev *dev = arg;
+	struct hadm_queue *q = dev->queues[SLAVER_SBIO_Q];
+	struct hadm_queue *sendq = g_hadm->p_sender_queue[P_DATA_TYPE];
+	struct hadm_thread *thr = dev->threads[SLAVER_BIO_HANDLER];
+
+	while (hadm_thread_get_state(thr) == HADM_THREAD_RUN) {
+		pack = hadm_queue_pop_entry_timeout(q, struct hdpacket,
+				list, msecs_to_jiffies(100));
+		if (IS_ERR_OR_NULL(pack)) {
+			if (IS_ERR(pack))	/* queue freezen */
+				msleep(500);
+			continue;
+		}
+
+		//dump_packet(__FUNCTION__, &pack->head);
+		/* data_snd or ctrl_snd */
+		ret = hadm_queue_push(sendq, &pack->list);
+		if (ret < 0) {
+			pr_err("%s: send error :%d.\n", __func__, ret);
+			continue;
+		}
+	}
+
+	complete(&thr->ev_exit);
+	return 0;
+}
+
+#define DBM_FLUSH_INTERVAL 2000
+int dbm_flusher(void *arg)
+{
+	int ret;
+	int flushed;
+	int cstate, dstate;
+	struct hadmdev *dev = arg;
+	struct hadm_site *runsite;
+	struct hadm_thread *thr = dev->threads[DBM_FLUSH_HANDLER];
+
+	while (hadm_thread_get_state(thr) == HADM_THREAD_RUN) {
+		flushed = 0;
+		list_for_each_entry(runsite, &dev->hadm_site_list, site) {
+			if (runsite->id == get_site_id())
+				continue;
+			//pr_info("%s: store dbm for site %d.\n", __func__, runsite->id);
+			//msleep(1000);
+			cstate = hadm_site_get(runsite, SECONDARY_STATE, S_CSTATE);
+			dstate = hadm_site_get(runsite, SECONDARY_STATE, S_DATA_STATE);
+			if (cstate != C_STOPPED || dstate != DATA_DBM)
+				continue;
+			ret = dbm_store_async(runsite->dbm);
+			if (ret < 0) {
+				pr_err("%s: store dbm failed.\n", __func__);
+				continue;
+			} else if (ret > 0)
+				flushed = 1;
+		}
+
+		//pr_info("%s finish one round flush.\n", __func__);
+		//msleep(1000);
+		//sync_bwr_meta(dev->bwr);
+		if (flushed && !bwr_low_water(dev->bwr)) {
+			continue;
+		} else {
+			set_current_state(TASK_INTERRUPTIBLE);
+			schedule_timeout(msecs_to_jiffies(DBM_FLUSH_INTERVAL));
+		}
+	}
+
+	complete(&thr->ev_exit);
+	return 0;
 }

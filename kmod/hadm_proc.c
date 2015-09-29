@@ -5,7 +5,7 @@
 #include "../include/common.inc"
 #include "../config.h"
 #include "../include/packet.inc"
-#include "hadm_node.h"
+#include "hadm_site.h"
 #include "hadm_struct.h"
 #include "hadm_device.h"
 #include "utils.h"
@@ -77,7 +77,7 @@ static int hadm_proc_open(struct inode *inode, struct file *file)
 
 	if (try_module_get(THIS_MODULE)) {
 		if(show != NULL) {
-			return single_open(file, show, PDE_DATA(inode));
+			return single_open(file, show, PDE(inode)->data);
 		}
 	}
 

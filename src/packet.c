@@ -1,30 +1,46 @@
 #include "common.h"
 
-struct sock_packet *alloc_sock_packet()
+struct sock_packet *alloc_sock_packet(int node_type)
 {
 	struct sock_packet *pkt;
+	size_t size;
 
-	pkt = malloc(sizeof(struct sock_packet));
+	size = sizeof(*pkt);
+	if (node_type == SITE_NODE)
+		size += MAX_IPADDR_LEN;
+
+	pkt = malloc(size);
 	if(pkt == NULL) {
 		return NULL;
 	}
 
-	memset(pkt, 0, sizeof(struct sock_packet));
+	memset(pkt, 0, size);
 
 	return pkt;
 }
 
-struct sock_packet *create_sock_packet(int node_id, int type)
+void log_sock_packet(struct sock_packet *pkt)
+{
+	log_debug("%s_HANDSHAKE from %s %d, ipaddr=%s",
+		  pkt->type == DATA_HANDSHAKE ? "DATA" : "META",
+		  node_type_name[pkt->node_type], pkt->node_id, pkt->ipaddr);
+}
+
+struct sock_packet *create_sock_packet(int type, int node_id, int node_type, char *ipaddr)
 {
 	struct sock_packet *pkt;
 
-	pkt = alloc_sock_packet();
+	pkt = alloc_sock_packet(node_type);
 	if(pkt == NULL) {
 		return NULL;
 	}
 
-	pkt->node_id = node_id;
 	pkt->type = type;
+	pkt->node_id = node_id;
+	pkt->node_type = node_type;
+	snprintf(pkt->ipaddr, MAX_IPADDR_LEN, "%s", ipaddr);
+
+	log_sock_packet(pkt);
 
 	return pkt;
 }
@@ -52,7 +68,6 @@ int sock_packet_recv(int fd, struct sock_packet *pkt)
 
 	ret = sock_read(fd, pkt, sizeof(struct sock_packet));
 	if(ret != sizeof(struct sock_packet)) {
-		log_error("Error: %s failed", __func__);
 		return -1;
 	}
 
@@ -68,7 +83,6 @@ struct packet *alloc_packet(uint32_t len)
 
 	pkt = malloc(total_len);
 	if(pkt == NULL) {
-		log_error("%s: alloc packet failed.\n", __func__);
 		return NULL;
 	}
 
@@ -96,7 +110,6 @@ int packet_send(int fd, struct packet *pkt)
 	int ret;
 
 	if(fd < 0) {
-		log_error("Error: %s wrong fd:%d", __func__, fd);
 		return -1;
 	}
 
@@ -104,7 +117,6 @@ int packet_send(int fd, struct packet *pkt)
 
 	ret = sock_write(fd, pkt, total_len);
 	if(ret != total_len) {
-		log_error("Error: %s write:(%d:%d)", __func__, total_len, ret);
 		return -1;
 	}
 
@@ -123,8 +135,6 @@ struct packet *packet_recv_header(int fd)
 
 	ret = sock_read(fd, hdr, sizeof(struct packet));
 	if(ret != sizeof(struct packet)) {
-		log_error("Error: recv packet header failed(%u:%d)",
-				sizeof(struct packet), ret);
 		free_packet(hdr);
 		return NULL;
 	}
@@ -140,13 +150,11 @@ struct packet *packet_recv(int fd)
 
 	hdr = packet_recv_header(fd);
 	if(hdr == NULL) {
-		log_error("Error: %s recv head failed", __func__);
 		return NULL;
 	}
 
 	pkt = alloc_packet(hdr->len);
 	if(pkt == NULL) {
-		log_error("Error: %s alloc packet failed", __func__);
 		goto err_hdr;
 	}
 
@@ -154,7 +162,6 @@ struct packet *packet_recv(int fd)
 
 	ret = sock_read(fd, pkt->data, pkt->len);
 	if(ret != pkt->len) {
-		log_error("Error: %s read data failed", __func__);
 		goto err_pkt;
 	}
 
@@ -178,6 +185,20 @@ int packet_set_node_to(int nr, struct packet *packet)
 int packet_test_node_to(int nr, struct packet *packet)
 {
 	return test_bit(nr, packet->node_to);
+}
+
+int get_packet_node_type(struct packet *packet)
+{
+	int p_type = packet->type;
+
+	if ((p_type >= P_SC_START && p_type <= P_SC_END) ||
+			(p_type >= P_SD_START && p_type <= P_SD_END))
+		return SITE_NODE;
+
+	if ((p_type >= P_NC_START && p_type <= P_NC_END) ||
+			(p_type >= P_ND_START && p_type <= P_ND_END))
+		return LOCAL_NODE;
+	return -1;
 }
 
 struct packet *create_config_packet(struct config *cfg)
@@ -371,106 +392,45 @@ int z_packet_send(int fd, struct z_packet *pkt)
 	return ret;
 }
 
-void packet_log_debug(struct packet *pkt,
-		      const char *node_to_str, const char *kmod_to_str)
-{
-	log_debug("|magic:%#lx|len:%u|type:%s|dev_id:%d|"
-			"node_from:%u|node_to:%s|"
-			"kmod_from:%x|kmod_to:%s|"
-			"dev_sector:%lu|bwr_sector:%lu|bwr_seq:%lu|"
-			"node_state_num:%d|errcode:%d|",
-			pkt->magic, pkt->len, packet_name[pkt->type], pkt->dev_id,
-			pkt->node_from, node_to_str,
-			pkt->kmod_from, kmod_to_str,
-			pkt->dev_sector, pkt->bwr_sector, pkt->bwr_seq,
-			pkt->node_state_num, pkt->errcode);
-}
-
-void packet_log_info(struct packet *pkt,
-		      const char *node_to_str, const char *kmod_to_str)
-{
-	log_info("|magic:%#lx|len:%u|type:%s|dev_id:%d|"
-			"node_from:%u|node_to:%s|"
-			"kmod_from:%x|kmod_to:%s|"
-			"dev_sector:%lu|bwr_sector:%lu|bwr_seq:%lu|"
-			"node_state_num:%d|errcode:%d|",
-			pkt->magic, pkt->len, packet_name[pkt->type], pkt->dev_id,
-			pkt->node_from, node_to_str,
-			pkt->kmod_from, kmod_to_str,
-			pkt->dev_sector, pkt->bwr_sector, pkt->bwr_seq,
-			pkt->node_state_num, pkt->errcode);
-}
-
-void packet_log_warn(struct packet *pkt,
-		      const char *node_to_str, const char *kmod_to_str)
-{
-	log_warn("|magic:%#lx|len:%u|type:%s|dev_id:%d|"
-			"node_from:%u|node_to:%s|"
-			"kmod_from:%x|kmod_to:%s|"
-			"dev_sector:%lu|bwr_sector:%lu|bwr_seq:%lu|"
-			"node_state_num:%d|errcode:%d|",
-			pkt->magic, pkt->len, packet_name[pkt->type], pkt->dev_id,
-			pkt->node_from, node_to_str,
-			pkt->kmod_from, kmod_to_str,
-			pkt->dev_sector, pkt->bwr_sector, pkt->bwr_seq,
-			pkt->node_state_num, pkt->errcode);
-}
-
-void packet_log_error(struct packet *pkt,
-		      const char *node_to_str, const char *kmod_to_str)
-{
-	log_error("|magic:%#lx|len:%u|type:%s|dev_id:%d|"
-			"node_from:%u|node_to:%s|"
-			"kmod_from:%x|kmod_to:%s|"
-			"dev_sector:%lu|bwr_sector:%lu|bwr_seq:%lu|"
-			"node_state_num:%d|errcode:%d|",
-			pkt->magic, pkt->len, packet_name[pkt->type], pkt->dev_id,
-			pkt->node_from, node_to_str,
-			pkt->kmod_from, kmod_to_str,
-			pkt->dev_sector, pkt->bwr_sector, pkt->bwr_seq,
-			pkt->node_state_num, pkt->errcode);
-}
-
-void bit_index_to_str(int bit, char *str, int len)
+void log_packet_header(struct packet *pkt)
 {
 	int idx;
 	int max_node = 0;
 	int node_num = 0;
 	char nfmt[8];
+	char node_to_str[128];
 
-	memset(str, 0, len);
-	for (idx = 0; idx < MAX_NODES; idx++) {
-		if (test_bit(idx, bit)) {
-			node_num += 1;
+	memset(node_to_str, 0, sizeof(node_to_str));
+	for(idx = 0; idx < MAX_NODES; idx++) {
+		if(packet_test_node_to(idx, pkt)) {
+			node_num++;
 			max_node = idx;
 		}
 	}
 
-	for (idx = 0; idx < max_node && node_num > 0; idx++) {
-		if (test_bit(idx, bit)) {
+	for(idx = 0; idx < max_node && node_num > 0; idx++) {
+		if(packet_test_node_to(idx, pkt)) {
 			memset(nfmt, 0, sizeof(nfmt));
 			snprintf(nfmt, sizeof(nfmt), "%d,", idx);
-			strncat(str, nfmt, len);
+			strncat(node_to_str, nfmt, sizeof(node_to_str));
 		}
 	}
 
-	if (node_num > 0) {
+	if(node_num > 0) {
 		memset(nfmt, 0, sizeof(nfmt));
 		snprintf(nfmt, sizeof(nfmt), "%d", max_node);
-		strncat(str, nfmt, len);
+		strncat(node_to_str, nfmt, sizeof(node_to_str));
 	} else {
-		snprintf(str, len, "NaN");
+		snprintf(node_to_str, sizeof(node_to_str), "NaN");
 	}
-}
 
-void log_packet_header(struct packet *pkt,
-		       void (*pkt_log_fn)(struct packet *, const char *, const char *))
-{
-	char node_to_str[128];
-	char kmod_to_str[128];
+	log_debug("|magic:%#lx|len:%u|type:%s|dev_id:%d|"
+			"node_from:%u|node_to:%s|"
+			"dev_sector:%lu|bwr_sector:%lu|"
+			"site_state_num:%d|errcode:%d|",
+			pkt->magic, pkt->len, packet_name[pkt->type], pkt->dev_id,
+			pkt->node_from, node_to_str,
+			pkt->dev_sector, pkt->bwr_sector,
+			pkt->site_state_num, pkt->errcode);
 
-	bit_index_to_str(pkt->node_to, node_to_str, sizeof(node_to_str));
-	bit_index_to_str(pkt->kmod_to, kmod_to_str, sizeof(kmod_to_str));
-
-	pkt_log_fn(pkt, node_to_str, kmod_to_str);
 }

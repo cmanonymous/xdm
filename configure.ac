@@ -1,7 +1,7 @@
 #                                               -*- Autoconf -*-
 # Process this file with autoconf to produce a configure script.
 
-AC_INIT([hadm], [2.0.0], [support@skybilityha.com])
+AC_INIT([hadm], [0.1], [cxy@skybility.com])
 # AM_INIT_AUTOMAKE([-Wall -Werror foreign])
 AM_INIT_AUTOMAKE([-Wall foreign])
 
@@ -35,7 +35,6 @@ AC_ARG_ENABLE([debug],
 # Checks for programs.
 AC_PROG_CC
 AC_PROG_LIBTOOL
-AC_PATH_PROG(RPMBUILD, rpmbuild)
 
 # Checks for libraries.
 # AC_CHECK_LIB([pthread], [pthread_create], [], [ echo "Error: need pthread" exit -1])
@@ -66,7 +65,7 @@ AC_TYPE_UINT8_T
 AC_FUNC_MALLOC
 AC_CHECK_FUNCS([clock_gettime gethostname memset select socket])
 
-PACKET_NAME=`sed -n -e '/P_HANDSHAKE/,/P_TYPE_MAX/{s/^[[[:space:]]]\+\([[_A-Z0-9]]\+\).*,/[[\1]] = "\1",/p}' ${srcdir}/include/packet.inc`
+PACKET_NAME=`sed -n -e '/P_CTRL_START/,/P_TYPE_MAX/{s/^[[[:space:]]]\+\([[_A-Z0-9]]\+\).*,/[[\1]] = "\1",/p}' ${srcdir}/include/packet.inc`
 AC_SUBST(PACKET_NAME)
 
 CSTATE_NAME=`sed -n -e '/C_STOPPED/,/C_SPLITBRAIN/{s/[[[:space:]]]*\(C_\)\(.*\),/[[\1\2]] = "\L\2",/p}' ${srcdir}/include/common.inc`
@@ -75,7 +74,7 @@ AC_SUBST(CSTATE_NAME)
 DATASTATE_NAME=`sed -n -e '/DATA_UPTODATE/,/DATA_CORRUPT/{s/[[[:space:]]]*\(DATA_\)\(.*\),/[[\1\2]] = "\L\2",/p}' ${srcdir}/include/common.inc`
 AC_SUBST(DATASTATE_NAME)
 
-DSTATE_NAME=`sed -n -e '/D_CONSISTENT/,/D_FAIL/{s/[[[:space:]]]*\(D_\)\(.*\),/[[\1\2]] = "\L\2",/p}' ${srcdir}/include/common.inc`
+DSTATE_NAME=`sed -n -e '/D_CONSISTENT/,/D_INCONSISTENT/{s/[[[:space:]]]*\(D_\)\(.*\),/[[\1\2]] = "\L\2",/p}' ${srcdir}/include/common.inc`
 AC_SUBST(DSTATE_NAME)
 
 NSTATE_NAME=`sed -n -e '/N_DISCONNECT/,/N_CONNECT/{s/[[[:space:]]]*\(N_\)\(.*\),/[[\1\2]] = "\L\2",/p}' ${srcdir}/include/common.inc`
@@ -99,9 +98,6 @@ AC_CONFIG_FILES([include/common_string.h])
 AC_CONFIG_FILES([Makefile
 		conf/Makefile
 		libs/Makefile
-		include/Makefile
-		specs/hadm.spec
-		specs/hadm-km.spec
 		src/Makefile])
 
 AC_OUTPUT
