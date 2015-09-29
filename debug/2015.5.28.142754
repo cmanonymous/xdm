@@ -1,0 +1,20 @@
+[13294.317275] bio_handler: ### bio_write_handler_run: BWrapper_write_queue: ffff880037329080
+[13294.320016] bio_handler: ### bio_write_handler_run: head=ffff880037329080, cur_node=          (null), cur_node_next=ffff880037329080, private=          (null)
+[13294.324242] thread lsync00 is started
+[13294.325431] cmd_worker: init device 0's config successed, now device num = 1
+[13294.327719] node_syncer: sync_local_thread is running
+[13296.172123] hadm_socket: hadm_do_handshake: send packet type 45
+[13296.175055] hadm_socket: hadm_do_handshake: recv packet type 46
+[13296.177431] hadm_socket: hadm_do_handshake: send packet type 43
+[13296.180022] hadm_socket: hadm_do_handshake: recv packet type 44
+[13321.037734] packet_handler: node 0 connect, do device 0 handshake
+[13321.040462] packet_handler: [1]__do_device_handshake
+[13321.129671] packet_handler: [4]p_handshake_ack: node 0
+[13321.131484] bwr: set_last_primary: set node 0 as my last primary, uuid = 4313033525, bwr_seq = 1
+[13321.133901] packet_handler: [5]send_startrep
+[13369.846680] p_data: __p_data: bio_wrapper=ffff88003ce79900, sync_mask=0x1
+[13369.852022] bio_handler: ### bio_write_handler_run: head=ffff880037329080, cur_node=ffff88003ce79930, cur_node_next=ffff880037329080, private=ffff88003ce79930
+[13369.860010] bio_handler: bio_write_handler_run: submit_bio_wrapper ffff88003ce79900
+[13369.863925] pre occu:data_size:1|maxsize:16384.
+[13369.866915] ### sync_mask_clear_node: bio_w=ffff88003ce79900, sync_mask=0x0, total call: 1
+[13370.530340] hadm_net_send failed: -14

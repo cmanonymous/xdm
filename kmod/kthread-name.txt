@@ -1,0 +1,23 @@
+
+模块在运行的过程中，会创建许多的内核线程。由于线程的名字太长会出现截断，所以在创
+建时缩短了内核线程的名字。
+
+为了避免引起误解，现在将 ps 显示出来的内核线程名字和它所运行的函数对应起来。
+
+    cmd_rcv ==> cmd_receiver_run
+    cmd_snd ==> cmd_sender_run
+    cmd_work ==> cmd_worker_run
+
+每个设备内部会有多个内核线程，这些内核线程显示的名字和它们对应运行的函数对应关系
+如下：
+
+    pkt ==> packet_handler_run
+    drcv ==> data_receiver_run
+    dsnd ==> data_sender_run
+    csnd ==> ctrl_sender_run
+    crcv ==> ctrl_client_run
+    dwork ==> data_worker_run
+    bio ==> bio_handler_run
+
+huruiqin@skybility.com
+2014/4/18

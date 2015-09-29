@@ -1,0 +1,240 @@
+[55053.462427] thread ctrl_rcv is started
+[55053.463585] thread ctrl_snd is started
+[55053.466587] thread data_rcv is started
+[55053.467522] thread data_snd is started
+[55053.468557] thread cmd_rcv is started
+[55053.469524] thread cmd_snd is started
+[55053.470451] thread cmd_worker is started
+
+[55055.198307] init node 1, protocol:1, real_protocol:0.
+[55055.199750] cmd_worker: cmd_worker_config_create_hadm_struct: node 1 BWR head init to 0
+[55055.203176] hadm_device: hadm0 attach to /dev/hadm/bdev(bdev=ffff88003bdb7400), minor=0, size=393216(sectors)*512
+[55055.209941] bwr: __bwr_check_data: init bwr data as a secondary node
+[55055.212188] bwr: check bwr data.
+[55055.213584] bwr: __bwr_check_data:init data: head = 2439,  tail = 2439, seq = 1.keep searching bwr data.
+[55055.217246] bwr: __bwr_check_data:init data , load all unsaved data from bwr,  now tail = 2439, seq = 1
+[55055.220986] cmd_worker: cmd_worker_config_create_hadm_struct:node 1 BWR start_sector = 2439, max_sector = 204795, max_size = 202356, disk_size = 0
+[55055.225227] init node 0, protocol:0, real_protocol:0.
+[55055.227067] cmd_worker: cmd_worker_config_create_hadm_struct: node 0 BWR head init to 2439, node cstate:0 dstate:1.
+[55055.230408] dbm: alloc_dbm alloc dbm ffff88003ab1ab40.
+[55055.232151] dbm: alloc_dbm_zones DBM_BDEV_SIZE_PER_ZONE:17592186044416, DBM_BDEV_SIZE_PER_PAGE:134217728,DBM_ZONE_SIZE:4194304, DBM_ZONE_RECORDS:131072, sizeof(dbm_zone):4194304.data_size:201326592, nr_zones:1,
+ total_pages:2.
+[55055.238302] dbm: alloc_dbm_zones alloc dbm_zones ffff88003cf3a5d8.
+[55055.240506] dbm: alloc_dbm_zones alloc dbm_zone ffff880021c00000.
+[55055.242291] dbm: init dbm_record:ffff880021c00000, page:ffffea0000f07080. page_num:0.
+[55055.244992] dbm: init dbm_record:ffff880021c00020, page:ffffea0000ea47c0. page_num:1.
+[55055.248269] dbm: node 0 load dbm page from sector 2048, total_size= 6144, read_bytes = 4096, total_bits = 0
+[55055.251516] dbm: node 0 load dbm page from sector 2056, total_size= 2048, read_bytes = 2048, total_bits = 0
+[55055.254733] dbm: dbm_create: id=0, start=2048(sector), dbm->disk_size=201326592(byte), disk_size:201326592 bits=0
+
+[55055.258176] thread ctrl_worker00 is started
+[55055.259629] thread data_worker00 is started
+[55055.261295] thread biowr00 is started
+[55055.263369] thread lsync00 is started
+
+[55055.264827] cmd_worker: init device 0's config successed, now device num = 1
+[55055.267016] node_syncer: sync_local_thread is running
+[55058.000129] hadm_socket: hadm_do_handshake: send packet type 45
+[55058.003199] hadm_socket: hadm_do_handshake: recv packet type 46
+[55058.005882] hadm_socket: hadm_do_handshake: send packet type 43
+[55058.008682] hadm_socket: hadm_do_handshake: recv packet type 44
+[55067.703428] packet_handler: node 0 connect, do device 0 handshake
+[55067.706171] packet_handler: [1]__do_device_handshake
+[55067.749686] packet_handler: [4]p_handshake_ack: node 0
+[55067.751743] bwr: set_last_primary: set node 0 as my last primary, uuid = 4308643838, bwr_seq = 1
+[55067.754571] packet_handler: [5]send_startrep
+
+[55082.319407] dump bwr data in after add page
+[55082.319408] uuid        :4308643838
+[55082.319409] bwr_seq     :2
+[55082.319409] bwr_sector  :2439
+[55082.319410] dev_sector  :0
+[55082.319411] checksum    :18446612135720923283
+[55082.329144] dump bwr data in bio->bi_io_vec[0]->bv_page
+[55082.329145] uuid        :4308643838
+[55082.329146] bwr_seq     :2
+[55082.329146] bwr_sector  :2439
+[55082.329147] dev_sector  :0
+[55082.329147] checksum    :18446612135720923283
+[55082.337215] gen_bio_wrapper_from_pack: gen bio ffff88003b2eae40 from pack
+[55082.339205] =========gen_bio_wrapper_from_pack================
+[55082.340290] bio->sector = 2439
+[55082.341206] bio->bi_vcnt = 2
+[55082.342238] bio->bi_idx = 0
+[55082.343242] bio->bi_size = 4608
+[55082.344317] bio->bi_bdev = ffff88003bdb7740
+[55082.345651] bio->bi_rw = write
+[55082.346500] =========gen_bio_wrapper_from_pack=================
+[55082.348094] --------dump_bio_wrapper start:-----------
+[55082.349431] wrapper bio:ffff88003b2eae40 cnt:1, hadmdev:hadm0,
+[55082.350554] bio_struct:ffff88003cbc4cc0, bio:ffff88003b2eae40, rw=WRITE, bdev:ffff88003bdb7740, sector:2439.
+[55082.353749] --------dump_bio_wrapper end:-----------
+[55082.355432] dump bwr data in gen_bio_wrapper_from_pack
+[55082.355433] uuid        :4308643838
+[55082.355433] bwr_seq     :2
+[55082.355434] bwr_sector  :2439
+[55082.355434] dev_sector  :0
+[55082.355435] checksum    :18446612135720923283
+[55082.363348] submit_bio_wrapper: rw=WRITE, disk_sector=2439, size=4608, wrapper bio=:ffff88003b2eae40[qaaz2], sync_node_mask=1
+[55082.367109] pre occu:data_size:1|maxsize:16384.
+[55082.368769] submit_bio_wrapper: submit bio from bio_struct , rw=WRITE, dev=bwr, disk_sector=2439, size=4608, wrapper bio=:ffff88003b2eae40[qaaz2], last seq = 1
+[55082.373682] =========submit_bio_wrapper================
+[55082.374955] bio->sector = 2439
+[55082.376299] bio->bi_vcnt = 2
+[55082.377373] bio->bi_idx = 0
+[55082.378726] bio->bi_size = 4608
+[55082.380167] bio->bi_bdev = ffff88003bdb7740
+[55082.381943] bio->bi_rw = write
+[55082.383490] =========submit_bio_wrapper=================bio_struct ffff88003cbc4cc0 , bio ffff88003b2eae40 is completed , bio_wrapper->count = 1
+[55082.388082] sync_mask_clear_node:clear node -1's sync mask of bio_wrapper ffff880036f16d00, sync_node_mask = 1
+[55082.389334] sync_mask_clear_node:bio_wrapper ffff880036f16d00 local completed,  add it to buffer
+[55082.389334] buffer_add_bio_wrapper:add bio_wrapper ffff880036f16d00 bio_struct ffff88003cbc4cc0 bwr_data ffff8800373c8180 bwr_seq 2 to buffer
+[55082.389334] pre occu:data_size:1.
+[55082.389334] sync_mask_clear_node:bio_wrapper ffff880036f16d00 , queue->private = ffff880036f16d30 is completed on all nodes,  end io now.
+[55082.389334] bio_wrapper_end_io wrapper finish, bio:ffff88003b2eae40 [write]
+[55082.402713] get send_head_data: 2(2439:0). prev:0
+[55082.403972] local try sync data: 2(2439:0).
+[55082.405516] sync_write_endio:bwr_data ffff8800373c8180(seq = 2) is completed without errors
+[55082.408011] __buffer_inuse_del try del 2(2439:0)...
+[55082.409368] __buffer_inuse_del entry ffff8800373c8180 is inuse head, forward search until reach to tail_data ffff8800373c8180 ...
+[55082.409507] __buffer_inuse_del:bwr data ffff8800373c8180 (private           (null)) is written to bdev
+[55082.409507] __buffer_inuse_del count = 1, update inuse_head to           (null) -> 0(0:0), next_entry =           (null).
+[55082.409507] inuse del:disk_sector:0|data_size:1.,next_entry:          (null), completed_bio_wrapper:           (null), count: 1
+[55082.409507] sync bwr_data 2(2439:0) finished.
+
+
+
+[55087.840443] general protection fault: 0000 [#1] SMP 
+[55087.843188] CPU 0 
+[55087.843639] Modules linked in: hadm_kmod(O) vesafb nfsd nfs lockd fscache auth_rpcgss nfs_acl sunrpc ext2 psmouse serio_raw snd_hda_intel snd_hda_codec virtio_console virtio_balloon mac_hid snd_hwdep snd_pcm sn
+d_timer snd soundcore snd_page_alloc i2c_piix4 lp parport floppy 8139too 8139cp
+[55087.844052] 
+[55087.844052] Pid: 896, comm: whoopsie Tainted: G           O 3.2.0-64-generic #97-Ubuntu Bochs Bochs
+[55087.844052] RIP: 0010:[<ffffffff8116611e>]  [<ffffffff8116611e>] kmem_cache_alloc_trace+0x5e/0x140
+[55087.844052] RSP: 0018:ffff88003cdcddd8  EFLAGS: 00010286
+[55087.844052] RAX: 0000000000000000 RBX: ffff88003bc7f900 RCX: 000000000001543a
+[55087.844052] RDX: 0000000000015439 RSI: 0000000000016610 RDI: ffff88003e002700
+[55087.844052] RBP: ffff88003cdcde28 R08: ffff88003fc16610 R09: 0000000000000000
+[55087.844052] R10: ffff88003e00a800 R11: 0000000000000246 R12: ffff88003e002700
+[55087.844052] R13: dead000000100100 R14: 00000000000000d0 R15: ffffffff815305c0
+[55087.844052] FS:  00007fc88cb397c0(0000) GS:ffff88003fc00000(0000) knlGS:0000000000000000
+[55087.844052] CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033
+[55087.844052] CR2: 00007fc88cb51000 CR3: 000000003c0a9000 CR4: 00000000000406f0
+[55087.844052] DR0: 0000000000000000 DR1: 0000000000000000 DR2: 0000000000000000
+[55087.844052] DR3: 0000000000000000 DR6: 00000000ffff0ff0 DR7: 0000000000000400
+[55087.844052] Process whoopsie (pid: 896, threadinfo ffff88003cdcc000, task ffff88003af59700)
+[55087.844052] Stack:
+[55087.844052]  0000000bfaacc495 ffffffff8153059d 0000000000000040 0000000000000280
+[55087.844052]  ffff88003cbb0d60 ffff88003bc7f900 ffff88003d694400 0000000000000000
+[55087.844052]  0000000000000000 00007fff13900e40 ffff88003cdcde48 ffffffff815305c0
+[55087.844052] Call Trace:
+[55087.844052]  [<ffffffff8153059d>] ? sock_alloc_inode+0x1d/0xc0
+[55087.844052]  [<ffffffff815305c0>] sock_alloc_inode+0x40/0xc0
+[55087.844052]  [<ffffffff81195436>] alloc_inode+0x26/0xa0
+[55087.844052]  [<ffffffff81196e7a>] new_inode_pseudo+0x1a/0x70
+[55087.844052]  [<ffffffff8153113e>] sock_alloc+0x1e/0x70
+[55087.844052]  [<ffffffff815337a5>] __sock_create+0x95/0x360
+[55087.844052]  [<ffffffff81533ad0>] sock_create+0x30/0x40
+[55087.844052]  [<ffffffff81533cab>] sys_socket+0x2b/0x70
+[55087.844052]  [<ffffffff8166bac2>] system_call_fastpath+0x16/0x1b
+[55087.844052] Code: 00 4d 8b 04 24 65 4c 03 04 25 50 da 00 00 49 8b 50 08 4d 8b 28 4d 85 ed 0f 84 d4 00 00 00 49 63 44 24 20 49 8b 34 24 48 8d 4a 01 <49> 8b 5c 05 00 4c 89 e8 65 48 0f c7 0e 0f 94 c0 84 c0 74 c2 4
+d 
+[55087.844052] RIP  [<ffffffff8116611e>] kmem_cache_alloc_trace+0x5e/0x140
+[55087.844052]  RSP <ffff88003cdcddd8>
+[55087.917026] ---[ end trace 668f12597de60f6c ]---
+
+
+
+
+[55092.710947] general protection fault: 0000 [#2] SMP 
+[55092.714380] CPU 0 
+[55092.714846] Modules linked in: hadm_kmod(O) vesafb nfsd nfs lockd fscache auth_rpcgss nfs_acl sunrpc ext2 psmouse serio_raw snd_hda_intel snd_hda_codec virtio_console virtio_balloon mac_hid snd_hwdep snd_pcm sn
+d_timer snd soundcore snd_page_alloc i2c_piix4 lp parport floppy 8139too 8139cp
+[55092.714846] 
+[55092.714846] Pid: 1726, comm: ctrl_rcv Tainted: G      D    O 3.2.0-64-generic #97-Ubuntu Bochs Bochs
+[55092.714846] RIP: 0010:[<ffffffff8116611e>]  [<ffffffff8116611e>] kmem_cache_alloc_trace+0x5e/0x140
+[55092.714846] RSP: 0018:ffff88003a95fd60  EFLAGS: 00010286
+[55092.714846] RAX: 0000000000000000 RBX: ffff8800373c8a00 RCX: 0000000000015446
+[55092.714846] RDX: 0000000000015445 RSI: 0000000000016610 RDI: ffff88003e002700
+[55092.714846] RBP: ffff88003a95fdb0 R08: ffff88003fc16610 R09: ffff8800373c8a00
+[55092.714846] R10: ffff88003af43400 R11: 0000000000000080 R12: ffff88003e002700
+[55092.714846] R13: dead000000100100 R14: 00000000000080d0 R15: ffffffffa0279779
+[55092.714846] FS:  0000000000000000(0000) GS:ffff88003fc00000(0000) knlGS:0000000000000000
+[55092.714846] CS:  0010 DS: 0000 ES: 0000 CR0: 000000008005003b
+[55092.714846] CR2: 00007f1211815000 CR3: 00000000373d6000 CR4: 00000000000406f0
+[55092.714846] DR0: 0000000000000000 DR1: 0000000000000000 DR2: 0000000000000000
+[55092.714846] DR3: 0000000000000000 DR6: 00000000ffff0ff0 DR7: 0000000000000400
+[55092.714846] Process ctrl_rcv (pid: 1726, threadinfo ffff88003a95e000, task ffff88003b272e00)
+[55092.714846] Stack:
+[55092.714846]  ffffffffffffffff ffff88003bc7f180 0000000000000028 ffffffff81165d74
+[55092.714846]  ffff88003a95fde0 ffff8800373c8a00 ffff88003bc7f180 0000000000000000
+[55092.714846]  0000000000000000 ffff88003cbc4cc0 ffff88003a95fdc0 ffffffffa0279779
+[55092.714846] Call Trace:
+[55092.714846]  [<ffffffff81165d74>] ? __kmalloc+0x134/0x190
+[55092.714846]  [<ffffffffa0279779>] hadm_pack_node_alloc+0x29/0x30 [hadm_kmod]
+[55092.714846]  [<ffffffffa0279804>] hadm_pack_node_create+0x24/0x60 [hadm_kmod]
+[55092.714846]  [<ffffffffa02798a8>] hadm_pack_node_clone+0x68/0xa0 [hadm_kmod]
+[55092.714846]  [<ffffffffa0279970>] hadm_receive_node+0x90/0x120 [hadm_kmod]
+[55092.714846]  [<ffffffffa0279fde>] p_receiver_run+0xee/0x210 [hadm_kmod]
+[55092.714846]  [<ffffffffa027a740>] ? p_data_sender_run+0x20/0x20 [hadm_kmod]
+[55092.714846]  [<ffffffffa027a750>] p_ctrl_receiver_run+0x10/0x20 [hadm_kmod]
+[55092.714846]  [<ffffffff8108b8bc>] kthread+0x8c/0xa0
+[55092.714846]  [<ffffffff8166dc34>] kernel_thread_helper+0x4/0x10
+[55092.714846]  [<ffffffff8108b830>] ? flush_kthread_worker+0xa0/0xa0
+[55092.714846]  [<ffffffff8166dc30>] ? gs_change+0x13/0x13
+[55092.714846] Code: 00 4d 8b 04 24 65 4c 03 04 25 50 da 00 00 49 8b 50 08 4d 8b 28 4d 85 ed 0f 84 d4 00 00 00 49 63 44 24 20 49 8b 34 24 48 8d 4a 01 <49> 8b 5c 05 00 4c 89 e8 65 48 0f c7 0e 0f 94 c0 84 c0 74 c2 4
+d 
+[55092.714846] RIP  [<ffffffff8116611e>] kmem_cache_alloc_trace+0x5e/0x140
+[55092.714846]  RSP <ffff88003a95fd60>
+[55092.833105] ---[ end trace 668f12597de60f6d ]---
+
+
+
+[55092.861342] general protection fault: 0000 [#3] SMP 
+[55092.863130] CPU 0 
+[55092.863534] Modules linked in: hadm_kmod(O) vesafb nfsd nfs lockd fscache auth_rpcgss nfs_acl sunrpc ext2 psmouse serio_raw snd_hda_intel snd_hda_codec virtio_console virtio_balloon mac_hid snd_hwdep snd_pcm sn
+d_timer snd soundcore snd_page_alloc i2c_piix4 lp parport floppy 8139too 8139cp
+[55092.865289] 
+[55092.865289] Pid: 1745, comm: hadm_main Tainted: G      D    O 3.2.0-64-generic #97-Ubuntu Bochs Bochs
+[55092.865289] RIP: 0010:[<ffffffff8116611e>]  [<ffffffff8116611e>] kmem_cache_alloc_trace+0x5e/0x140
+[55092.865289] RSP: 0018:ffff88003cf3dbe8  EFLAGS: 00010286
+[55092.865289] RAX: 0000000000000000 RBX: ffff88003d3650c0 RCX: 0000000000015446
+[55092.865289] RDX: 0000000000015445 RSI: 0000000000016610 RDI: ffff88003e002700
+[55092.865289] RBP: ffff88003cf3dc38 R08: ffff88003fc16610 R09: 0000000000000000
+[55092.865289] R10: 0000000000000000 R11: ffffc90000000000 R12: ffff88003e002700
+[55092.865289] R13: dead000000100100 R14: 00000000000000d0 R15: ffffffff811da951
+[55092.865289] FS:  00007f120f53a700(0000) GS:ffff88003fc00000(0000) knlGS:0000000000000000
+[55092.865289] CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033
+[55092.865289] CR2: 00007f1211815000 CR3: 00000000373d6000 CR4: 00000000000406f0
+[55092.865289] DR0: 0000000000000000 DR1: 0000000000000000 DR2: 0000000000000000
+[55092.865289] DR3: 0000000000000000 DR6: 00000000ffff0ff0 DR7: 0000000000000400
+[55092.865289] Process hadm_main (pid: 1745, threadinfo ffff88003cf3c000, task ffff88003abd1700)
+[55092.865289] Stack:
+[55092.865289]  ffff88003cf3dc18 ffffffff811e1bc8 0000000000000028 ffff8800257dc300
+[55092.865289]  0000000000000000 ffff88003d3650c0 ffff88003cf3de38 00000000fffffff4
+[55092.865289]  0000000000000000 ffff88003b4ad8a0 ffff88003cf3dc98 ffffffff811da951
+[55092.865289] Call Trace:
+[55092.865289]  [<ffffffff811e1bc8>] ? proc_lookup_de+0xb8/0x110
+[55092.865289]  [<ffffffff811da951>] proc_reg_open+0x51/0x190
+[55092.865289]  [<ffffffff81178bb0>] __dentry_open+0x2b0/0x380
+[55092.865289]  [<ffffffff811da900>] ? proc_alloc_inode+0xb0/0xb0
+[55092.865289]  [<ffffffff812a13fc>] ? security_inode_permission+0x1c/0x30
+[55092.865289]  [<ffffffff81186c4a>] ? inode_permission+0x4a/0x110
+[55092.865289]  [<ffffffff8117934d>] vfs_open+0x3d/0x40
+[55092.865289]  [<ffffffff8117a410>] nameidata_to_filp+0x40/0x50
+[55092.865289]  [<ffffffff81189488>] do_last+0x3f8/0x730
+[55092.865289]  [<ffffffff8118ab61>] path_openat+0xd1/0x3f0
+[55092.865289]  [<ffffffff81090272>] ? hrtimer_cancel+0x22/0x30
+[55092.865289]  [<ffffffff8118afa2>] do_filp_open+0x42/0xa0
+[55092.865289]  [<ffffffff8131e411>] ? strncpy_from_user+0x31/0x40
+[55092.865289]  [<ffffffff811862ea>] ? do_getname+0x10a/0x180
+[55092.865289]  [<ffffffff8166349e>] ? _raw_spin_lock+0xe/0x20
+[55092.865289]  [<ffffffff811982c7>] ? alloc_fd+0xf7/0x150
+[55092.865289]  [<ffffffff8117a518>] do_sys_open+0xf8/0x240
+[55092.865289]  [<ffffffff8117a680>] sys_open+0x20/0x30
+[55092.865289]  [<ffffffff8166bac2>] system_call_fastpath+0x16/0x1b
+[55092.865289] Code: 00 4d 8b 04 24 65 4c 03 04 25 50 da 00 00 49 8b 50 08 4d 8b 28 4d 85 ed 0f 84 d4 00 00 00 49 63 44 24 20 49 8b 34 24 48 8d 4a 01 <49> 8b 5c 05 00 4c 89 e8 65 48 0f c7 0e 0f 94 c0 84 c0 74 c2 4
+d 
+[55092.865289] RIP  [<ffffffff8116611e>] kmem_cache_alloc_trace+0x5e/0x140
+[55092.865289]  RSP <ffff88003cf3dbe8>
+[55092.946734] ---[ end trace 668f12597de60f6e ]---

@@ -1,0 +1,70 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<hadm>
+	<global>
+		<kmodport>9997</kmodport>
+		<ping>10</ping>
+		<pingtimeout>10</pingtimeout>
+	</global>
+
+	<servers>
+		<server>
+			<id>0</id>
+			<localipaddr>192.168.9.51</localipaddr>
+			<localport>9998</localport>
+			<remoteipaddr>192.168.9.88</remoteipaddr>
+			<remoteport>9999</remoteport>
+		</server>
+		<server>
+			<id>1</id>
+			<localipaddr>192.168.9.52</localipaddr>
+			<localport>9999</localport>
+			<remoteipaddr>192.168.9.89</remoteipaddr>
+			<remoteport>9999</remoteport>
+		</server>
+	</servers>
+
+	<nodes>
+		<node>
+			<id>0</id>
+			<serverid>0</serverid>
+			<hostname>zdc01</hostname>
+		</node>
+		<node>
+			<id>1</id>
+			<serverid>0</serverid>
+			<hostname>zdc02</hostname>
+		</node>
+		<node>
+			<id>2</id>
+			<serverid>1</serverid>
+			<hostname>zdc03</hostname>
+		</node>
+	</nodes>
+
+	<resources>
+		<resource>
+			<id>0</id>
+			<name>hadm0</name>
+			<runnodes>
+				<runnode>
+					<id>0</id>
+					<protocol>async</protocol>
+					<disk>/dev/hadm/bdev</disk>
+					<bwr_disk>/dev/hadm/bwr</bwr_disk>
+				</runnode>
+				<runnode>
+					<id>1</id>
+					<protocol>sync</protocol>
+					<disk>/dev/hadm/bdev</disk>
+					<bwr_disk>/dev/hadm/bwr</bwr_disk>
+				</runnode>
+				<runnode>
+					<id>2</id>
+					<protocol>sync</protocol>
+					<disk>/dev/hadm/bdev</disk>
+					<bwr_disk>/dev/hadm/bwr</bwr_disk>
+				</runnode>
+			</runnodes>
+		</resource>
+	</resources>
+</hadm>

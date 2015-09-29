@@ -1,0 +1,93 @@
+
+安装
+===
+
+root# ls *.rpm
+hadm-km-2.0.0_2.6.32_358.el6.x86_64-1.el6.x86_64.rpm  hadm-utils-2.0.0-1.el6.x86_64.rpm
+
+root# rpm -i hadm-km-*.rpm
+root# rpm -i hadm-utils-*.rpm
+
+其中，hadm-km 包括了一个处理存储读写的内核模块，hadm-utils 包括了用户态的工具。
+
+配置
+===
+
+需要在配置文件（/opt/hadm/etc/hadm_conf.xml）中指定可运行的节点，hadm 资源的底层
+数据存储设备和数据传输一致性的磁盘。
+
+相应的示例配置文件可参考 /opt/hadm/etc/*.sample。
+
+初始化（fullsync同步）
+=====
+
+以两台机器为例：
+
+u01 192.168.4.31 bdev(256M) bwr(128M)
+u02 192.168.4.32 bdev(256M) bwr(128M)
+
+u01# /opt/hadm/bin/hadmctl init hadm0
+u01# /opt/hadm/bin/hadmctl startkmod
+u01# /opt/hadm/bin/hadmctl up hadm0
+u01# /opt/hadm/bin/hadm_main
+
+u02# /opt/hadm/bin/hadmctl init hadm0
+u02# /opt/hadm/bin/hadmctl startkmod
+u02# /opt/hadm/bin/hadmctl up hadm0
+u02# /opt/hadm/bin/hadm_main
+
+由于两台机器是初次配置的，所以要进行全同步：
+
+u01# /opt/hadm/bin/hadmctl primary hadm0
+u01# mkfs.ext3 -b 4096 /dev/hadm0
+u01# /opt/hadm/bin/hadmctl status hadm0
+
+查看状态，在看到从节点的 cstate 是 corrupt 的状态后，才可以开始进行全同步。
+
+u01# /opt/hadm/bin/hadmctl fullsync hadm0 1
+
+全同步完成之后，也就是 cstate 的状态变为 sync 之后，往 /dev/hadm0 设备写入的数据
+将会同步到对端节点。
+
+正常数据同步
+========
+
+u01# mount /dev/hadm0 /mnt
+u01# cp /boot/config-* /mnt
+u01# md5sum /mnt/* > /mnt/md5sum.txt
+u01# umount /mnt
+
+当所有的同步完成之后，可以切换主节点到对端节点：
+
+u01# /opt/hadm/bin/hadmctl secondary hadm0
+
+u02# /opt/hadm/bin/hadmctl primary hadm0
+u02# mount /dev/hadm0 /mnt
+u02# md5sum -c /mnt/md5sum.txt
+
+上面的命令中，最后的验证 md5 的步骤应该是输出 OK 的结果，如果有输出不正确的话，
+那么就说明出现了严重的问题了。
+
+dbm同步
+======
+
+当本地节点写入的速度太快，或者网络断开之后写入大于 BWR 磁盘的大小，则会产生
+bitmap；产生 bitmap 之后，可能需要手动同步。
+
+u02# /opt/hadm/bin/hadmctl delta_sync hadm0 0
+
+同步成功之后，查看状态之后，同步状态会变为“sync”。
+
+cmsync同步
+=========
+
+当节点网络断开之后，两个节点都变为主节点写入数据，这样就会产生数据冲突。这个时候，
+需要放弃一个节点的数据。下面的例子中，我们放弃节点 u02 的数据：
+
+u02# /opt/hadm/bin/hadmctl secondary hadm0
+u01# /opt/hadm/bin/hadmctl cmsync hadm0 1
+
+同步成功之后，查看状态之后，同步状态会变为“sync”。
+
+huruiqin
+2015.5.11

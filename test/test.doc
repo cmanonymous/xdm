@@ -1,0 +1,288 @@
+1.hadm0正常同步
+  [步骤]
+  1.node1, node2建立连接，分别为Ｐ，Ｓ节点。
+    node1:
+      hatest up
+      hadmctl primary hadm0
+    node2:
+      hatest up
+  2.P节点写入数据(< srl size)
+    node1:
+      dd if=/dev/vda2 of=/dev/hadm0 bs=4096 count=4096
+  3.等srl传输完成，比较P,S端磁盘数据是否一致
+  　node1:
+      dd if=/dev/hamd0 of=/mnt/file1 bs=4096 count=4096
+    node2:
+      dd if=/dev/hadm0 of=/mnt/file2 bs=4096 count=4096
+
+    md5sum /mnt/file1 /mnt/file2
+  [结果]
+  数据一致
+  [预期]
+  数据一致
+
+2. hadm0正常同步，在同步中切换主从
+　[步骤]
+  1.node1, node2建立连接，分别为Ｐ，Ｓ节点。
+    node1:
+      hatest up
+      hadmctl primary hadm0
+    node2:
+      hatest up
+  2.P节点写入数据(< srl size)
+    node1:
+      dd if=/dev/vda2 of=/dev/hadm0 bs=4096 count=4096
+  3.在srl传输过程中，Ｐ节点尝试切换成Ｓ节点。
+    node1:
+      hadmctl secondary hadm0
+  [结果]
+  不能切换,提示srl & bitmap有值。
+  [预期]
+  不能切换
+
+3. hadm0断线重连(srl未满)
+  [步骤]
+  1.node1和node2建立连接，分别为Primary/Secondary
+    node1:
+      hatest up
+      hadmctl primary hadm0
+    node2:
+      hatest up
+  2.在两个节点握手连接后，Ｐ节点用iptables断开与Ｓ节点的连接，
+    并往hadm0中写入数据(< srl size)
+    node1:
+      iptables -A INPUT -s 192.168.10.221 -j DROP
+      dd if=/dev/vda2 of=/dev/hadm0 bs=4096 count=4096
+  3.在nstate变为disconnect后，恢复Ｐ、Ｓ节点之间的连接。
+    node1:
+      iptables -F
+  [结果]
+  在断开连接后，node2显示状态不变。
+  Ｐ，Ｓ节点恢复连接，但srl并没减少。
+  [预期]
+  断开连接后，node2显示node1 disconnect/Secondary
+  恢复连接后，srl恢复传输。
+
+4. hadm0二次断线重连(srl未满)
+  [步骤]
+  1.node1和node2建立连接，分别为Primary/Secondary
+    node1:
+      hatest up
+      hadmctl primary hadm0
+    node2:
+      hatest up
+  2.在两个节点握手连接后，Ｐ节点用iptables断开与Ｓ节点的连接，
+    并往hadm0中写入数据(< srl size)
+    node1:
+      iptables -A INPUT -s 192.168.10.221 -j DROP
+      dd if=/dev/vda2 of=/dev/hadm0 bs=4096 count=4096
+  3.在nstate变为disconnect后，恢复Ｐ、Ｓ节点之间的连接。
+    node1:
+      iptables -F
+  4.当srl开始传输数据时，再次断开Ｐ、Ｓ节点之间网络连接,
+    并重新写入新数据(< srl size)
+    node1:
+      iptables -A INPUT -s 192.168.10.221 -j DROP
+      dd if=/dev/vda2 of=/dev/hadm0 bs=4096 count=4096
+  5.在nstate变为disconnect后，恢复Ｐ、Ｓ节点之间的连接。
+    node1:
+      iptables -F
+  [结果]
+  在断开连接后，node2显示状态不变.
+  Ｐ，Ｓ节点恢复连接，但srl并没减少。
+  [预期]
+  断开连接后，node2显示node1 disconnect/Secondary
+  恢复连接后，srl恢复传输。
+
+5. hadm0断线重连(srl满)
+  [步骤]
+  1.node1和node2建立连接，分别为Primary/Secondary
+    node1:
+      hatest up
+      hadmctl primary hadm0
+    node2:
+      hatest up
+  2.在两个节点握手连接后，Ｐ节点用iptables断开与Ｓ节点的连接，
+    并往hadm0中写入数据(> srl size)
+    node1:
+      iptables -A INPUT -s 192.168.10.221 -j DROP
+      dd if=/dev/vda2 of=/dev/hadm0 bs=4096 count=16384     /* 64M */
+  3.在nstate变为disconnect后，恢复Ｐ、Ｓ节点之间的连接。
+    node1:
+      iptables -F
+  4.Ｐ、Ｓ节点连接后，用resync推送数据
+  　node1:
+      hadmctl resync hadm0 1
+  [结果]
+  在恢复连接前，调用resync没有错误提示。
+  在断开连接后，node2显示node1状态不变.
+  恢复连接后，resync传输正常，传过去的数据能保持一致。
+  [预期]
+  断开连接后，node2显示node1 disconnect/Secondary
+  resync后数据保持一致。
+
+6. hadm0 bitmap传输过程中断线
+  [步骤]
+  1.node1和node2建立连接，分别为Primary/Secondary
+    node1:
+      hatest up
+      hadmctl primary hadm0
+    node2:
+      hatest up
+  2.在两个节点握手连接后，Ｐ节点用iptables断开与Ｓ节点的连接，
+    并往hadm0中写入数据(> srl size)
+    node1:
+      iptables -A INPUT -s 192.168.10.221 -j DROP
+      dd if=/dev/vda2 of=/dev/hadm0 bs=4096 count=16384     /* 64M */
+  3.在nstate变为disconnect后，恢复Ｐ、Ｓ节点之间的连接。
+    node1:
+      iptables -F
+  4.Ｐ、Ｓ节点连接后，用resync推送数据
+  　node1:
+      hadmctl resync hadm0 1
+  5.在bitmap传输过程中，再次用iptables断掉网络，再次写入新数据，
+    node1:
+      iptables -A INPUT -s 192.168.10.221 -j DROP
+      dd if=/dev/vda2 of=/dev/hadm0 bs=4096 count=16384 seek=16384    /* 64M */
+  6.在nstate变为disconnect后，恢复Ｐ、Ｓ节点之间的连接。
+    node1:
+      iptables -F
+  [结果]
+  在恢复连接后，bitmap很快全部发送完成。没有第二次使用resync命令。观察期间内存使用状况，hadm_main占用大量内存(717/527)。
+  [预期]
+  在掉线恢复后，应需要第二次使用resync命令。
+  hadm_main占用内存应保持在较低水平。
+
+7. srl传输过程中产生bitmap
+  [步骤]
+  1.node1和node2建立连接，分别为Primary/Secondary
+    node1:
+      hatest up
+      hadmctl primary hadm0
+    node2:
+      hatest up
+  2.在两个节点握手连接后， 往hadm0中连续写入数据(> srl size)
+    node1:
+      dd if=/dev/vda2 of=/dev/hadm0 bs=4096 count=4096      /* 16M */
+      等srl在传输的时候，继续写入数据导致产生bitmap:
+      dd if=/dev/vda2 of=/dev/hadm0 bs=4096 count=16384     /* 64M */
+  3.在node2的cstate变为bitmap后，用resync推送数据
+    node1:
+      hadmctl resync hadm0 1
+  [结果]
+  数据保持一致
+  [预期]
+  数据保持一致
+
+8. 数据一致性验证（主机掉电 srl未满)
+ [步骤]
+  1.node1和node2建立连接，分别为Primary/Secondary
+    node1:
+      hatest up
+      hadmctl primary hadm0
+    node2:
+      hatest up
+  2.在两个节点握手连接后，Ｐ节点往hadm0中写入数据(< srl size)
+    node1:
+      dd if=/dev/vda2 of=/dev/hadm0 bs=4096 count=4096    /* 16M */
+  3.在srl传输过程中，Ｐ节点掉电重启,重新启用hadm，变为primary节点。
+    node1:
+      force poweroff && boot
+      hatest up
+      hadmctl primary hadm0
+  4.观察在节点恢复连接后，srl能否续传。
+  [结果]
+  在恢复连接后，srl不能续传。
+  [预期]
+  在恢复连接后，srl应能续传。
+
+9. 数据一致性验证（备机掉电 srl未满)
+ [步骤]
+  1.node1和node2建立连接，分别为Primary/Secondary
+    node1:
+      hatest up
+      hadmctl primary hadm0
+    node2:
+      hatest up
+  2.在两个节点握手连接后，Ｐ节点往hadm0中写入数据(< srl size)
+    node1:
+      dd if=/dev/vda2 of=/dev/hadm0 bs=4096 count=4096    /* 16M */
+  3.在srl传输过程中，S节点掉电重启,重新启用hadm，建立连接。
+    node2:
+      force poweroff && boot
+      hatest up
+  4.观察在节点恢复连接后，srl能否续传。
+  [结果]
+  在恢复连接后，srl不能续传。
+  [预期]
+  在恢复连接后，srl应能续传。
+
+10. 数据一致性验证（主机掉电 srl满)
+ [步骤]
+  1.node1和node2建立连接，分别为Primary/Secondary
+    node1:
+      hatest up
+      hadmctl primary hadm0
+    node2:
+      hatest up
+  2.在两个节点握手连接后，Ｐ节点往hadm0中写入数据(> srl size)
+    node1:
+      dd if=/dev/vda2 of=/dev/hadm0 bs=4096 count=16384     /* 64M */
+  3.在bitmap传输过程中，P节点掉电重启,重新启用hadm，建立连接。
+    node1:
+      force poweroff && boot
+      hatest up
+      hadmctl primary hadm0
+  4.观察在节点恢复连接后，bitmap能否续传。
+    如若不能，主节点继续调用resync传输
+    node1:
+      hadmctl resync hadm0 1
+  [结果]
+  在恢复连接后，bitmap不续传, 用resync恢复传输。传输完成后数据一致。
+  [预期]
+  在恢复连接后，bitmap不续传, 用resync恢复传输。传输完成后数据一致。
+
+11. 数据一致性验证（备机掉电 srl满)
+ [步骤]
+  1.node1和node2建立连接，分别为Primary/Secondary
+    node1:
+      hatest up
+      hadmctl primary hadm0
+    node2:
+      hatest up
+  2.在两个节点握手连接后，Ｐ节点往hadm0中写入数据(> srl size)
+    node1:
+      dd if=/dev/vda2 of=/dev/hadm0 bs=4096 count=16384     /* 64M */
+  3.在srl传输过程中，S节点掉电重启,重新启用hadm，建立连接。
+    node2:
+      force poweroff && boot
+      hatest up
+  4.观察在节点恢复连接后，bitmap能否续传。
+    如若不能，主节点继续调用resync传输
+    node1:
+      hadmctl resync hadm0 1
+  [结果]
+  在恢复连接后，bitmap续传, 传输完成后数据一致。
+  [预期]
+  在恢复连接后，bitmap不续传, 用resync恢复传输。传输完成后数据一致。
+
+12. 数据一致性验证（重启hadm server)
+ [步骤]
+  1.node1和node2建立连接，分别为Primary/Secondary
+    node1:
+      hatest up
+      hadmctl primary hadm0
+    node2:
+      hatest up
+  2.在两个节点握手连接后，Ｐ节点往hadm0中写入数据(< srl size)
+    node1:
+      dd if=/dev/vda2 of=/dev/hadm0 bs=4096 count=4096      /* 16M */
+  3.在srl传输过程中，P节点重启hadm_main server
+    node1:
+    kill -9 `ps axo pid,cmd | grep [h]adm_main | awk '{print $1};'`
+    hatest up
+  4.观察在节点恢复连接后，srl能否续传。
+  [结果]
+  在恢复连接后，srl不能续传。
+  [预期]
+  在恢复连接后，srl应能续传。

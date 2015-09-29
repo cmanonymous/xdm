@@ -1,0 +1,217 @@
+
+解决了一个 BUG，现在将解决的尝试过程，到最终的结果记录下来。
+
+在 commit(5db3b6296598d3516534db2081f8a868ff7b638c) 中，在主备握手之后，在主机写
+入数据，备机马上就崩溃了，崩溃的 oops 参见这个目录下的几个文件：
+
+        2015.5.28.093015
+        2015.5.28.101721
+        2015.5.28.142754
+
+这个 commit 原先输出的日志都被我删掉了，文件输出的都是我手工加上去的。
+
+现在记录下来，我是怎么解决这个问题的。
+
+1. 除了初始化的日志外，其他所有循环的日志都删除
+
+因为日志太多，并且不是我加入打印的，因此就算看到了这些日志，我也不能确切地知道发
+生了什么事情。因此，我把所有的日志都先删除，然后加入自己打印的日志。
+
+2. 修复所有的编译警告
+
+在修复这个警告的过程中，就发现了一个指针转换不兼容的问题。也就是
+hadm_queue_first_entry 宏的定义不正确。
+
+原先的定义中，本应输入 hadm_queue_node 的类型，手误写成了 hadm_node，由于这个原
+因，在 hadm_node_net_head_inc() 中，从队列中得到 bio_wrapper 就铁定不正确了。
+
+3. 分析备机的写入过程
+
+备机收到一个 P_DATA 之后，将会产生一个 bio_wrapper{}，然后将它加入到
+hadmdev->bio_wrapper_queue[HADM_IO_WRITE] 队列中，这个队列在 bio_write_handler
+线程中处理。
+
+bio_write_handler 线程取得队列元素的入口，将这个 bio_wrapper{} 下发，写入到 BWR
+中，但是它不会立刻删除这个元素，而是在 bio_end_io 中删除这个元素。
+
+删除的操作发生在 sync_mask_clear_node() 中，它将会在写入 BWR 成功之后，将整个
+bio_wrapper{} 加入到 buffer 中，然后调用 bio_wrapper_end_io()。对于备机来说，这
+个函数要做的事情是：发送一个 ACK 给主机，释放这个 bio_wrapper{}。
+
+4. 缩小出错的范围
+
+研究了代码之后，我开始尝试定位出错的位置。首先，在处理 P_DATA 的函数中，不做任何
+事情，直接返回，这个时候内核没有挂死，在主机挂起了，因为这是同步模式，所以这是正
+常的。
+
+然后，我猜想可能是删除 bio_wrapper{} 的地方引起了错误，因此集中精力研究了这里的
+代码。删除的入口在 sync_mask_clear_node() 中，这个函数遍历 bio_wrapper{} 链表，
+对于每个 bio_wrapper{}，在写入 BWR 完成之后，把它加入到 buffer 中，在写入指定的
+设备（sync_node_mask=0）完成之后，删除这个元素，同时调用 bio_wrapper_end_io()。
+
+我尝试在写入 BWR 完成之后，不要加入 buffer，但是由于使用 buffer 的代码耦合地太多，
+在禁用 buffer 之后，主机写入数据之后，也不能完成了。因此，这个路径先缓一缓。
+
+然后，我尝试在备机中 bio_wrapper{} 完成之后，不要删除和释放。在备机运行之后，这
+样的修改没有发生崩溃！因此，可以断定问题出现在删除和释放的地方。最终，在把代码修
+改成以下的形式之后，可以确定错误出现的位置了：
+
+        /* __hadm_queue_del_node(queue, &bio_w->node); */
+        bio_wrapper_end_io(bio_w);
+
+在 bio_wrapper_end_io() 中，我首先把释放 bio_wrapper{} 的代码加入注释：
+
+void bio_wrapper_end_io(struct bio_wrapper *bio_wrapper)
+{
+	int rw = bio_data_dir(bio_wrapper->bio);
+	struct hadm_pack_node *ack_node = NULL;
+
+	if(bio_wrapper->private == NULL) {
+		bio_endio(bio_wrapper->bio,bio_wrapper->err);
+	}else {
+		ack_node = (struct hadm_pack_node *)bio_wrapper->private;
+		ack_node->pack->errcode = bio_wrapper->err;
+		packet_node_send(ack_node);
+		hadm_pack_node_free(ack_node);
+	}
+#if 0
+	if(rw  ==  WRITE && !bio_wrapper->err &&
+			bio_wrapper->private == NULL){
+		buffer_set_io_completed(bio_wrapper);
+
+	}
+	_hadm_end_io_acct(bio_wrapper);
+	free_bio_wrapper(bio_wrapper);
+#endif
+}
+
+这次执行之后，备机问题依旧。为了确定备机的执行路径，我再次把代码修改如下：
+
+void bio_wrapper_end_io(struct bio_wrapper *bio_wrapper)
+{
+	int rw = bio_data_dir(bio_wrapper->bio);
+	struct hadm_pack_node *ack_node = NULL;
+
+	if(bio_wrapper->private == NULL) {
+		pr_info("=================================\n");
+		bio_endio(bio_wrapper->bio,bio_wrapper->err);
+	}else {
+		pr_info("###################################\n");
+		ack_node = (struct hadm_pack_node *)bio_wrapper->private;
+		ack_node->pack->errcode = bio_wrapper->err;
+		packet_node_send(ack_node);
+		hadm_pack_node_free(ack_node);
+	}
+#if 0
+	if(rw  ==  WRITE && !bio_wrapper->err &&
+			bio_wrapper->private == NULL){
+		buffer_set_io_completed(bio_wrapper);
+
+	}
+	_hadm_end_io_acct(bio_wrapper);
+	free_bio_wrapper(bio_wrapper);
+#endif
+}
+
+这次确定了备机执行的是 else 部分的路径，然后我注释掉了 hadm_pack_node_free()：
+
+void bio_wrapper_end_io(struct bio_wrapper *bio_wrapper)
+{
+	int rw = bio_data_dir(bio_wrapper->bio);
+	struct hadm_pack_node *ack_node = NULL;
+
+	if(bio_wrapper->private == NULL) {
+		pr_info("=================================\n");
+		bio_endio(bio_wrapper->bio,bio_wrapper->err);
+	}else {
+		pr_info("###################################\n");
+		ack_node = (struct hadm_pack_node *)bio_wrapper->private;
+		ack_node->pack->errcode = bio_wrapper->err;
+		packet_node_send(ack_node);
+		/* hadm_pack_node_free(ack_node); */
+	}
+#if 0
+	if(rw  ==  WRITE && !bio_wrapper->err &&
+			bio_wrapper->private == NULL){
+		buffer_set_io_completed(bio_wrapper);
+
+	}
+	_hadm_end_io_acct(bio_wrapper);
+	free_bio_wrapper(bio_wrapper);
+#endif
+}
+
+这一次，备机没有崩溃！然后我仔细地研究了 hadm_pack_node_free() 的代码，然后很机
+械地加入一个全局的 atomic_t 变量用来跟踪它的调用次数：
+
+extern atomic_t pack_free_count;
+/* NOTE: don't use refcnt yet */
+void hadm_pack_node_free(struct hadm_pack_node	*node)
+{
+	atomic_inc(&pack_free_count);
+	pr_info("### %s: call %d times\n", __FUNCTION__, atomic_read(&pack_free_count));
+        dump_stack();
+
+	if (IS_ERR_OR_NULL(node)) {
+		return;
+	}
+	if (atomic_dec_and_test(&node->refcnt)) {
+		if (node->pack)
+			kfree(node->pack);
+		kfree(node);
+	}
+}
+
+注意，这一次我没有在 bio_wrapper_end_io() 中注释掉 hadm_pack_node_free() 执行，
+而是保留了它，因此备机应该挂掉。这次，打印出来的日志太多了，不易于分析，因为很多
+地方都有调用到 hadm_pack_node_free()。
+
+经过一番思考，我认为是 ack_node 提前释放了，然后在把它的引用计数打印出来：
+
+void bio_wrapper_end_io(struct bio_wrapper *bio_wrapper)
+{
+	int rw = bio_data_dir(bio_wrapper->bio);
+	struct hadm_pack_node *ack_node = NULL;
+
+	if(bio_wrapper->private == NULL) {
+		pr_info("=================================\n");
+		bio_endio(bio_wrapper->bio,bio_wrapper->err);
+	}else {
+		pr_info("###################################\n");
+		ack_node = (struct hadm_pack_node *)bio_wrapper->private;
+		ack_node->pack->errcode = bio_wrapper->err;
+		pr_info("### ack_node: qnode(next=%p, prev=%p), refcnt=%d, pack=%p, sock%p\n",
+			ack_node->q_node.node.next, ack_node->q_node.node.prev,
+			atomic_read(&ack_node->refcnt), ack_node->pack, ack_node->sock);
+		packet_node_send(ack_node);
+		/* hadm_pack_node_free(ack_node); */
+	}
+#if 0
+	if(rw  ==  WRITE && !bio_wrapper->err &&
+			bio_wrapper->private == NULL){
+		buffer_set_io_completed(bio_wrapper);
+
+	}
+	_hadm_end_io_acct(bio_wrapper);
+	free_bio_wrapper(bio_wrapper);
+#endif
+}
+
+它输出的引用计数是 1。packet_node_send() 把这个 ack_node 加入到 p_sender_run()
+的队列中，紧接着就马上调用 hadm_pack_node_free() 释放掉了这个 ack_node，但是在队
+列中还保留着一个野指针，能够取得这个地址。如果在 p_sender_run() 中取得的这个地址
+中的数据，引用到的 node->refcnt 是 1 的话，那么就会造成 double free 的问题了。或
+者是在队列取得元素的过程中，就会出错，因为这个野指针指向的地址已经变成不合法的了。
+
+在加入 p_sender_run() 队列中，也有可能引起问题：因为 bio_wrapper_end_io() 可能在
+中断上下文中运行，因此不能睡眠，但是加入队列的操作 hadm_queue_push() 在队列满的
+情况下，是会睡眠的，这样就会引起严重的问题。
+
+解决的方法，只需要在 bio_wrapper_end_io() 中删除 hadm_pack_node_free()，由最终的
+发送者释放掉这个 ack_node。在 packet_node_send() 中。
+
+最后，总结一下这个问题：还好运气比较好，只是一个简单的内存释放问题，而没有牵涉到
+其他太多的地方。
+
+huruiqin
+2015.5.29

@@ -1,0 +1,53 @@
+HADM_KMOD := hadm_kmod
+obj-m := $(HADM_KMOD).o
+
+cealn-files := compat.h
+ccflags-y += -g
+
+$(HADM_KMOD)-objs := main.o
+$(HADM_KMOD)-objs += hadm_struct.o
+$(HADM_KMOD)-objs += hadm_config.o
+$(HADM_KMOD)-objs += hadm_packet.o
+$(HADM_KMOD)-objs += hadm_socket.o
+$(HADM_KMOD)-objs += hadm_device.o
+$(HADM_KMOD)-objs += hadm_node.o
+$(HADM_KMOD)-objs += hadm_thread.o
+$(HADM_KMOD)-objs += hadm_queue.o
+$(HADM_KMOD)-objs += hadm_bio.o
+$(HADM_KMOD)-objs += primary_info.o
+$(HADM_KMOD)-objs += bio_helper.o
+$(HADM_KMOD)-objs += buffer.o
+$(HADM_KMOD)-objs += bwr.o
+$(HADM_KMOD)-objs += bwr_data.o
+$(HADM_KMOD)-objs += dbm.o
+$(HADM_KMOD)-objs += fullsync.o
+$(HADM_KMOD)-objs += cmd_worker.o
+$(HADM_KMOD)-objs += bio_handler.o
+$(HADM_KMOD)-objs += node_syncer.o
+$(HADM_KMOD)-objs += p_data.o
+$(HADM_KMOD)-objs += packet_handler.o
+$(HADM_KMOD)-objs += p_worker.o
+$(HADM_KMOD)-objs += utils.o
+$(HADM_KMOD)-objs += hadm_proc.o
+$(HADM_KMOD)-objs += hadm_proc_show.o
+
+# 为每个对象加入一个目标路径
+$(patsubst %,$(obj)/%,$($(HADM_KMOD)-objs)): $(obj)/compat.h
+
+# 生成 compat.h 文件
+$(obj)/compat.h: $(wildcard $(src)/compat/tests/*.c) FORCE
+	$(call filechk,compat.h)
+
+filechk_compat.h =									\
+	for test_file in $(filter-out FORCE,$^); do					\
+		var=`echo $$test_file |							\
+			sed -e "s!.*/!COMPAT_!" -e "s!\.c!!" |				\
+			tr -- -a-z _A-Z | tr -dc A-Z0-9_`;				\
+		if $(CC) $(c_flags) $(COMPAT_CFLAGS) -c -o $(obj)/test.o $$test_file	\
+				> /dev/null $(if $(quiet),2>&1); then			\
+			echo "\#define $$var";						\
+			rm -f $(obj)/test.{o,gcda,gcno};				\
+		else									\
+			echo "/* \#undef $$var */";					\
+		fi;									\
+	done

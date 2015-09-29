@@ -1,0 +1,52 @@
+#ifndef __COMMON_STRING_H__
+#define __COMMON_STRING_H__
+
+#ifndef NOT_USE_PACKET_NAME
+static const char *packet_name[]  __attribute__ ((unused)) = {
+	@PACKET_NAME@
+};
+#endif
+
+#ifndef NOT_USE_DATASTATE_NAME
+static const char *datastate_name[]  __attribute__ ((unused)) = {
+	@DATASTATE_NAME@
+};
+#endif
+
+#ifndef NOT_USE_CSTATE_NAME
+static const char *cstate_name[]  __attribute__ ((unused)) = {
+	@CSTATE_NAME@
+};
+#endif
+
+#ifndef NOT_USE_DSTATE_NAME
+static const char *dstate_name[]  __attribute__ ((unused)) = {
+	@DSTATE_NAME@
+};
+#endif
+
+#ifndef NOT_USE_NSTATE_NAME
+static const char *nstate_name[]  __attribute__ ((unused)) = {
+	@NSTATE_NAME@
+};
+#endif
+
+#ifndef NOT_USE_ROLE_NAME
+static const char *role_name[]  __attribute__ ((unused)) = {
+	@ROLE_NAME@
+};
+#endif
+
+#ifndef NOT_USE_DEV_STATE_NAME
+static const char *dev_state_name[]  __attribute__ ((unused)) = {
+	@DEV_STATE_NAME@
+};
+#endif
+
+#ifndef NOT_USE_PROTO_NAME
+static const char *proto_name[]  __attribute__ ((unused)) = {
+	@PROTO_NAME@
+};
+#endif
+
+#endif // __COMMON_STRING_H__

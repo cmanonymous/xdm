@@ -1,0 +1,73 @@
+-------------------------------------------
+        讨论纪要　2014-7-31
+-------------------------------------------
+
+1 将syncer分为两个线程，分别对应write_local, write_remote/write_bmap.
+   将local/remote分开的原因在于，发往其它节点的数据包队列有长度限制，而这个限制不应阻塞本地磁盘数据的写入。
+
+2 resync加入了对当前节点，本地节点srl头指针的检查，伪代码如下。
+int resync_node(node)
+{
+        /* resync bitmap阶段是从local disk中读取数据，
+         *          * 如果当前节点head指针大于本地节点的head指针，
+         *                   * 则意味着该节点srl中的数据比本地磁盘的要新，
+         *                            * 需要等待local disk的数据刷下去。
+         *                                     */
+        if (srl_info->srl_head[local_node->id] < srl_info->srl_head[node->id])
+                wait_for(srl_info->srl_head[local_node->id] >= srl_info->srl_head[node->id]);
+
+        /* 根据该节点当前bitmap信息，从本地磁盘中读取数据进行resync */
+        resync_bitmap(node);
+
+        /* 由于在resync过程中，本地盘也在写入数据，
+         *          * 因此还需要同步该段新写入的数据，才能保证resync完成后数据一致
+         *                   */
+        start = srl_head(node->id);
+        end = srl_head(local_node->id);
+
+        resync_srl(node, start, end);
+
+        set_cstate(node, ready, consisitant);
+}
+
+3 讨论了fullsync的实现，基本同resync，但是在同步前需要设置node_head。伪代码如下：
+void fullsync_node(node)
+{
+        /* 将当前节点的bitmap全置为１ */
+        set_bm_all(node);
+
+        /* 如有需要，等待本地节点head指针到达该节点head指针
+         *          * 原因参照resync_node
+         *                   */
+        if (srl_info->srl_head[local_node->id] < srl_info->srl_head[node->id])
+                wait_for(srl_info->srl_head[local_node->id] >= srl_info->srl_head[node->id]);
+
+        /* 将当前节点的head指针置为本地节点head指针的值 */
+        srl_info->srl_head[node->id] = srl_info->srl_head[local_node->id];
+
+        fullsync_bitmap(node);
+
+        /* 由于在fullsync过程中，本地盘也在写入数据，
+         *          * 因此还需要同步该段新写入的数据，才能保证resync完成后数据一致
+         *                   */
+        start = srl_head(node->id);
+        end = srl_head(local_node->id);
+        resync_srl(node, start, end);
+
+        set_cstate(node, ready, consisitant);
+}
+
+4 新数据写入srl盘后，　tail指针会前移，　如果考虑到断电的情况，那么tail指针在移动前还应该满足下面这个条件：
+        srl_tail <= srl_head_in_disk;
+  否则掉电重启后，srl盘中的数据是不一致的(srl_head_in_disk ~ srl_tail之间的数据已经被覆盖)。
+
+
+5 当前syncer_run的代码中
+        if (srl_info->srl_head[runnode] > snd_head)
+                continue;
+这种情况何时会出现？怎么出现的？
+
+还有就是，对于新的cstate变为ready的节点(比如刚resync/fullsync/fbsync完成的节点，网络断开又连接的节点)，
+怎么传输其SRL数据? （当该节点变为ready后，send_head可能大于该节点的head, node_head ~ send_head之间的数据怎么传）
+节点状态变为ready后，send_head = node_head?
+

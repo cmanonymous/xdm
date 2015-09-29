@@ -1,0 +1,147 @@
+=============
+hadm logowner
+=============
+
+Contents:
+
+ (*) hadm模型
+
+ (*) hadm线程
+     - 全局线程
+     - 子设备(hadmdev)线程
+
+ (*) io流程
+     - MP(master primary)节点
+     - MS(master secondary)节点
+     - SP(slaver primary)节点
+     - SS(slaver secondary)节点
+
+
+========
+hadm模型
+========
+
+Hadm模型分两个层次:
+ (1) 全局hadm设备.
+     负责全局的处理，包括与server的连接，收发数据. 与命令行的交互，执行命令.
+     维护子设备(hadmdev)链表，对每个子设备进行控制.
+     logowner模型下，全局设备的静态信息中添加了local_node_id.
+
+ (2) 子设备(hadmdev).
+     hadmdev对应每个同步的资源设备，它负责本地及其它slaver io的处理，
+     与其它site的数据同步。维护了一个site（其它远程logowner节点）链表和一个
+     node(本地slaver节点）链表。
+     logowner模型下，hadmdev添加了node链表，负责与各个node的通信以及io处理.
+
+
+========
+hadm线程
+========
+
+hadm中有许多处理线程，其中有常驻线程和即时线程(有某种条件触发，只运行一段时间）.
+
+常驻线程包括:
+
+ (1) 全局线程
+     全局hadm设备的处理线程，主要包括：
+      (*) 与命令行交互的cmd_worker线程.
+      (*) 与server通信的收发线程(p_ctrl_receiver, p_data_receiver, p_ctrl_sender, p_data_sender).
+
+ (2) 子设备线程
+      (*) 处理site包的线程(site_data_worker, site_meta_worker).
+      (*) 处理node包的线程(node_data_worker, node_meta_worker).
+
+     当子设备所在节点是MP节点时，还拥有io处理线程：
+      (*) 处理io写入bwr盘的线程(bio_read_handler_run, bio_write_handler_run), io来自本地
+          或者来自SP节点.
+      (*) node bio处理线程(node_bio_sender), 负责将完成的node bio响应发送出去.
+      (*) local sync线程(sync_local_thread), 负责将io写到本地盘.
+      (*) site sync线程(sync_remote_thread), 负责将io分发到其它MS节点.
+
+
+=======
+IO 流程
+=======
+
+ (*) MP(master primary)节点
+
+ (*) MS(master secondary)节点
+
+ (*) SP(slaver primary)节点
+     下面是处理IO流程的伪代码:
+
+     (1) SP节点处理下发的bio,
+         hadmdev_make_request()
+	 {
+		...
+		if (!hadmdev_local_master(hadmdev))
+		        hadmdev_submit_slaver_bio(hadmdev, bio);
+		...
+	 }
+
+         /* 将bio添加到slaver bio队列，并发送出去 */
+	 hadmdev_submit_slaver_bio(dev, bio)
+	 {
+		 // 加入队列是为了跟踪slaver bio信息
+		 hadmdev_slaver_bio_add(hadmdev, bio);
+		 // NOTE: slaver bio的发送最好采用scatter/gather的方式，避免复制
+		 hadmdev_slaver_bio_send(hadmdev, bio);
+	 }
+
+     (2) MP节点在node_data_worker中收到该slaver bio包，并处理：
+	 p_node_io()
+	 {
+		...
+		bio = pack->data;
+		if (bio_data_dir(bio) == READ) {
+			/* READ * 尝试从buffer的inuse list中查找bio请求的数据，
+			 * 如果找到重叠的数据，那么将这个bio加入到该bwr_data的一个
+			 * slaver bio等待队列中， 当该bwr_data从inuse_list中删
+			 * 除的时候，将该slaver bio队列加入到node_bio_sender队列
+			 * 中.
+			 * 如果没有重叠数据，那么直接加入到node_bio_sender队列中
+			 */
+			ret = slaver_bio_try_wait_inuse(bio, buffer);
+			if (!ret)
+				send_slaver_rbio_ack(node, bio);
+		} else {
+			/* WRITE
+			 * 构造wrapper下发，标识wrapper为remote, 当最后一个subbio按序
+			 * 加入到buffer里的时候，会检查srl_data的remote标志，如果是
+			 * remote,则将该srl_data->private中的slaver bio加入到node_bio_
+			 * sender队列.
+			 */
+			wrapper = init_bio_wrapper(bio, endio);
+			set_wrapper_remote(wrapper);
+			hadm_queue_push(wrapper_queue, &wrapper->node);
+		}
+		...
+	}
+
+	node_bio_sender()
+	{
+		...
+		while ((hadm_thread_get_state(thr)) == HADM_THREAD_RUN) {
+			io_data = hadm_queue_pop_timeout(q, msecs_to_jiffies(100));
+			if (!io_data)
+				continue;
+
+			hadmdev_send_slaver_io_ack(dev, io_data);
+		}
+		....
+	}
+
+    (3) SP节点在收到slaver_io_ack后，对其处理：
+	p_node_io_ack()
+	{
+		...
+		error = pack->error ? -EIO : 0;
+		bio_endio(pack->data, error);
+		...
+	}
+
+    以上是slaver bio的正常处理流程，异常情况下需要清理掉两端的slaver bio，可能需要某种
+    机制来判定收到的slaver bio ack是否是有效的.
+
+
+ (*) SS(slaver secondary)节点
